@@ -1,14 +1,160 @@
-html, body, #root {
+html,
+body,
+#root {
   height: 100%;
   margin: 0;
+}
+
+body {
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(52, 152, 219, 0.2), transparent 32%),
+    linear-gradient(180deg, #07111f 0%, #0f1d33 100%);
+  color: #f4f8ff;
 }
 
 #root {
   width: 100%;
 }
 
-canvas {
-  width: 100% !important;
-  height: 100% !important;
+.app-shell {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 32px 16px;
+  box-sizing: border-box;
+}
+
+.panel {
+  width: min(960px, 100%);
+  background: rgba(6, 15, 27, 0.82);
+  border: 1px solid rgba(142, 197, 252, 0.18);
+  border-radius: 24px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  padding: 24px;
+  backdrop-filter: blur(16px);
+}
+
+.hero-copy h1 {
+  margin: 8px 0 10px;
+  font-size: clamp(2rem, 4vw, 3rem);
+}
+
+.eyebrow {
+  margin: 0;
+  color: #8ec5fc;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.72rem;
+}
+
+.subtitle {
+  margin: 0 0 24px;
+  color: #cdd9eb;
+  max-width: 48rem;
+}
+
+.avatar-card {
+  border-radius: 20px;
+  overflow: hidden;
+  background: #02070d;
+  border: 1px solid rgba(142, 197, 252, 0.14);
+}
+
+.avatar-video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
   display: block;
+  background:
+    radial-gradient(circle at center, rgba(142, 197, 252, 0.12), transparent 40%),
+    #010306;
+  object-fit: cover;
+}
+
+.avatar-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.status {
+  margin: 0;
+  color: #d8e4f6;
+}
+
+.composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.composer input,
+.composer button {
+  border-radius: 14px;
+  border: 1px solid rgba(142, 197, 252, 0.16);
+  font: inherit;
+}
+
+.composer input {
+  padding: 14px 16px;
+  background: rgba(9, 20, 36, 0.92);
+  color: #f4f8ff;
+}
+
+.composer input::placeholder {
+  color: #90a4bf;
+}
+
+.composer button {
+  padding: 14px 18px;
+  background: linear-gradient(135deg, #8ec5fc 0%, #3f7cf1 100%);
+  color: #08111d;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.composer button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.response-card {
+  margin-top: 18px;
+  padding: 16px;
+  border-radius: 16px;
+  background: rgba(9, 20, 36, 0.82);
+  border: 1px solid rgba(142, 197, 252, 0.12);
+}
+
+.response-card span {
+  color: #8ec5fc;
+  font-size: 0.85rem;
+}
+
+.response-card p {
+  margin: 8px 0 0;
+  color: #ecf3ff;
+  line-height: 1.6;
+}
+
+.message {
+  margin: 0;
+}
+
+.error {
+  color: #ffb4b4;
+}
+
+@media (max-width: 720px) {
+  .panel {
+    padding: 18px;
+  }
+
+  .composer {
+    grid-template-columns: 1fr;
+  }
 }
