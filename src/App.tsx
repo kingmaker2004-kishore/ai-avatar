@@ -1,42 +1,226 @@
-import { useState } from "react";
-import LiveAvatarComponent from "./LiveAvatar";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import {
+  API_BASE_URL,
+  fetchApi,
+  type BootstrapResponse,
+  type Conversation,
+  type PersonaSummary,
+  type StoredMessage
+} from "./api";
+import PersonaSetup from "./PersonaSetup";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000";
+const ENABLE_AVATAR = import.meta.env.VITE_ENABLE_AVATAR === "true";
+const CURRENT_CONVERSATION_STORAGE_KEY = "persona-avatar-current-conversation-id";
+const LiveAvatarComponent = lazy(() => import("./LiveAvatar"));
+
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+};
+
+function toChatMessages(messages: StoredMessage[]) {
+  return messages.map((message) => ({
+    id: crypto.randomUUID(),
+    role: message.role as "user" | "assistant",
+    text: message.content
+  }));
+}
+
+function applyPersonaDetails(
+  persona: PersonaSummary,
+  setPersonaName: (value: string) => void,
+  setPersonaSummary: (value: string) => void
+) {
+  setPersonaName(persona.name || "Persona Avatar");
+  setPersonaSummary(
+    persona.summary ||
+      "Grounded in the current chat, earlier chats, memory videos, and a structured knowledge base."
+  );
+}
+
+function getStoredConversationId() {
+  const existing = window.localStorage.getItem(CURRENT_CONVERSATION_STORAGE_KEY);
+  return existing ?? null;
+}
 
 export default function App() {
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [playbackRequest, setPlaybackRequest] = useState(0);
+  const [personaName, setPersonaName] = useState("Persona Avatar");
+  const [personaSummary, setPersonaSummary] = useState(
+    "Grounded in the current chat, earlier chats, memory videos, and a structured knowledge base."
+  );
+  const [groundingItems, setGroundingItems] = useState<string[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(getStoredConversationId());
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [showConversationList, setShowConversationList] = useState(false);
+  const [isBootstrapLoading, setIsBootstrapLoading] = useState(true);
+  const [isPersonaReady, setIsPersonaReady] = useState(false);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  async function loadConversations() {
+    const { response, data } = await fetchApi("/api/conversations");
+
+    if (!response.ok) {
+      throw new Error(data.error ?? "Failed to load conversations");
+    }
+
+    setConversations(data.conversations ?? []);
+  }
+
+  async function loadCurrentConversation(activeConversationId: string) {
+    const { response, data } = await fetchApi(`/api/conversations/${activeConversationId}`);
+
+    if (response.status === 404) {
+      window.localStorage.removeItem(CURRENT_CONVERSATION_STORAGE_KEY);
+      setConversationId(null);
+      setMessages([]);
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(data.error ?? "Failed to load conversation");
+    }
+
+    setMessages(toChatMessages((data.messages ?? []) as StoredMessage[]));
+  }
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadBootstrap = async () => {
+      try {
+        const { response, data } = await fetchApi("/api/persona/bootstrap");
+
+        if (!response.ok || !isMounted) {
+          return;
+        }
+
+        const bootstrap = data as BootstrapResponse;
+        applyPersonaDetails(bootstrap.persona, setPersonaName, setPersonaSummary);
+        setIsPersonaReady(!bootstrap.requiresSetup);
+      } catch (err) {
+        console.warn("Unable to load bootstrap state:", err);
+        setError(err instanceof Error ? err.message : "Unable to load persona setup.");
+      } finally {
+        if (isMounted) {
+          setIsBootstrapLoading(false);
+        }
+      }
+    };
+
+    void loadBootstrap();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPersonaReady) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const loadChatState = async () => {
+      try {
+        await loadConversations();
+
+        if (!isMounted || !conversationId) {
+          return;
+        }
+
+        await loadCurrentConversation(conversationId);
+      } catch (err) {
+        console.warn("Unable to load chat state:", err);
+      }
+    };
+
+    void loadChatState();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [conversationId, isPersonaReady]);
+
+  useEffect(() => {
+    const transcript = transcriptRef.current;
+
+    if (!transcript) {
+      return;
+    }
+
+    transcript.scrollTo({
+      top: transcript.scrollHeight,
+      behavior: "smooth"
+    });
+  }, [messages, isLoading]);
 
   const sendMessage = async () => {
     const message = input.trim();
 
-    if (!message || isLoading) {
+    if (!message || isLoading || !isPersonaReady) {
       return;
     }
 
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: message
+    };
+
+    setMessages((current) => [...current, userMessage]);
+    setInput("");
     setPlaybackRequest((value) => value + 1);
     setIsLoading(true);
     setError("");
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat`, {
+      const { response, data } = await fetchApi("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ message })
+        body: JSON.stringify({
+          message,
+          conversationId
+        })
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
+      if (!response.ok) {
         throw new Error(data.error ?? "Backend error");
       }
-      setResponse(data.reply ?? "");
-      setInput("");
+
+      if (data.conversationId && !conversationId) {
+        setConversationId(data.conversationId as string);
+        window.localStorage.setItem(CURRENT_CONVERSATION_STORAGE_KEY, data.conversationId as string);
+      }
+
+      const reply = (data.reply as string) ?? "";
+
+      setMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: reply
+        }
+      ]);
+      setResponse(reply);
+      setPersonaName((data.personaName as string) ?? "Persona Avatar");
+      setGroundingItems([
+        ...((data.grounding?.knowledge ?? []) as string[]),
+        ...((data.grounding?.memories ?? []) as string[]),
+        ...((data.grounding?.priorChats ?? []) as string[])
+      ]);
+
+      void refreshConversationsAfterChat();
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : "Backend error");
@@ -46,23 +230,218 @@ export default function App() {
     }
   };
 
+  const refreshConversationsAfterChat = async () => {
+    try {
+      await loadConversations();
+    } catch (err) {
+      console.warn("Failed to refresh conversations:", err);
+    }
+  };
+
+  const startNewConversation = async () => {
+    try {
+      const { response: res, data } = await fetchApi("/api/conversations", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ title: "Untitled" })
+      });
+
+      if (!res.ok) {
+        throw new Error(data.error ?? "Failed to create conversation");
+      }
+
+      setConversationId(data.id);
+      window.localStorage.setItem(CURRENT_CONVERSATION_STORAGE_KEY, data.id);
+      setMessages([]);
+      setResponse("");
+      setGroundingItems([]);
+      setInput("");
+
+      void refreshConversationsAfterChat();
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Failed to create conversation");
+    }
+  };
+
+  const resetPersona = async () => {
+    try {
+      const { response, data } = await fetchApi("/api/persona", {
+        method: "DELETE"
+      });
+
+      if (!response.ok) {
+        throw new Error(data.error ?? "Failed to reset persona");
+      }
+
+      setIsPersonaReady(false);
+      setIsBootstrapLoading(false);
+      setMessages([]);
+      setResponse("");
+      setGroundingItems([]);
+      setInput("");
+      setConversations([]);
+      setShowConversationList(false);
+      window.localStorage.removeItem(CURRENT_CONVERSATION_STORAGE_KEY);
+      setConversationId(null);
+      setError("");
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Failed to reset persona");
+    }
+  };
+
+  const selectConversation = (convId: string) => {
+    setConversationId(convId);
+    window.localStorage.setItem(CURRENT_CONVERSATION_STORAGE_KEY, convId);
+    setShowConversationList(false);
+    setResponse("");
+    setGroundingItems([]);
+    setInput("");
+  };
+
+  if (isBootstrapLoading) {
+    return (
+      <main className="app-shell">
+        <section className="panel setup-panel">
+          <div className="hero-copy">
+            <p className="eyebrow">WhatsApp Persona Setup</p>
+            <h1>Loading Persona</h1>
+            <p className="subtitle">Checking whether this browser already has a saved persona.</p>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (!isPersonaReady) {
+    return (
+      <main className="app-shell">
+        <PersonaSetup
+          onError={setError}
+          onReady={(persona) => {
+            applyPersonaDetails(persona, setPersonaName, setPersonaSummary);
+            setError("");
+            setIsPersonaReady(true);
+            setMessages([]);
+            setResponse("");
+            setGroundingItems([]);
+            setInput("");
+            setShowConversationList(false);
+            window.localStorage.removeItem(CURRENT_CONVERSATION_STORAGE_KEY);
+            setConversationId(null);
+          }}
+        />
+        {error ? <p className="message error">{error}</p> : null}
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <section className="panel">
         <div className="hero-copy">
-          <p className="eyebrow">LiveAvatar + Groq</p>
-          <h1>AI Avatar Assistant</h1>
-          <p className="subtitle">
-            Ask a question, get a Groq response, and have your LiveAvatar speak it
-            back in real time.
-          </p>
+          <p className="eyebrow">Persona-Grounded LiveAvatar</p>
+          <h1>{personaName}</h1>
+          <p className="subtitle">{personaSummary}</p>
+          <div className="conversation-controls">
+            <button
+              className="btn-text"
+              onClick={() => void startNewConversation()}
+              title="Start a new conversation with the persona"
+            >
+              + New Chat
+            </button>
+            <button
+              className="btn-text"
+              onClick={() => setShowConversationList(!showConversationList)}
+              title="View conversation history"
+            >
+              History ({conversations.length})
+            </button>
+            <button
+              className="btn-text"
+              onClick={() => void resetPersona()}
+              title="Re-import a WhatsApp chat and choose a different person"
+            >
+              Change Persona
+            </button>
+          </div>
         </div>
 
-        <LiveAvatarComponent
-          apiBaseUrl={API_BASE_URL}
-          playbackRequest={playbackRequest}
-          text={response}
-        />
+        {showConversationList && conversations.length > 0 ? (
+          <div className="conversation-list">
+            <h3>Conversation History</h3>
+            <div className="conversations">
+              {conversations.map((conv) => (
+                <button
+                  key={conv.id}
+                  className={`conversation-item ${conv.id === conversationId ? "active" : ""}`}
+                  onClick={() => selectConversation(conv.id)}
+                >
+                  <div className="conv-title">{conv.title}</div>
+                  <div className="conv-meta">
+                    {conv.message_count} messages • {new Date(conv.updated_at).toLocaleDateString()}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {ENABLE_AVATAR ? (
+          <Suspense
+            fallback={
+              <section className="avatar-card avatar-disabled">
+                <div className="avatar-meta">
+                  <p className="status">Loading avatar module...</p>
+                </div>
+              </section>
+            }
+          >
+            <LiveAvatarComponent
+              apiBaseUrl={API_BASE_URL}
+              playbackRequest={playbackRequest}
+              text={response}
+            />
+          </Suspense>
+        ) : (
+          <section className="avatar-card avatar-disabled">
+            <div className="avatar-meta">
+              <p className="status">
+                Avatar playback is paused. This session is running in LLM-only mode.
+              </p>
+            </div>
+          </section>
+        )}
+
+        <div ref={transcriptRef} className="transcript">
+          {messages.length === 0 ? (
+            <p className="transcript-empty">
+              Start a conversation. Replies will stay grounded in the chosen person&apos;s
+              WhatsApp style, the current thread, and earlier chats with the same user.
+            </p>
+          ) : (
+            messages.map((message) => (
+              <article
+                key={message.id}
+                className={`chat-bubble ${message.role === "user" ? "user" : "assistant"}`}
+              >
+                <span>{message.role === "user" ? "You" : personaName}</span>
+                <p>{message.text}</p>
+              </article>
+            ))
+          )}
+
+          {isLoading ? (
+            <article className="chat-bubble assistant pending">
+              <span>{personaName}</span>
+              <p>Thinking...</p>
+            </article>
+          ) : null}
+        </div>
 
         <div className="composer">
           <input
@@ -73,7 +452,7 @@ export default function App() {
                 void sendMessage();
               }
             }}
-            placeholder="Ask something..."
+            placeholder={`Talk to ${personaName}...`}
           />
 
           <button onClick={() => void sendMessage()} disabled={isLoading || !input.trim()}>
@@ -84,8 +463,19 @@ export default function App() {
         {error ? <p className="message error">{error}</p> : null}
 
         <div className="response-card">
-          <span>AI response</span>
-          <p>{response || "Your Groq response will show up here."}</p>
+          <span>Grounding</span>
+          <p>
+            {groundingItems.length > 0
+              ? "This reply was grounded using the chosen persona style and any relevant prior-chat context."
+              : "Persona style clues and relevant prior-chat context will appear here after a response."}
+          </p>
+          <div className="grounding-tags">
+            {groundingItems.map((item) => (
+              <span key={item} className="grounding-tag">
+                {item}
+              </span>
+            ))}
+          </div>
         </div>
       </section>
     </main>

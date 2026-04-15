@@ -1,19 +1,52 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 import cors from "cors";
 import express from "express";
+import {
+  analyzePersonaReplyNeed,
+  buildDeterministicPersonaReply,
+  buildHeuristicPersonaReply,
+  buildPersonaPrompt,
+  getGroundingSummary,
+  loadPersonaProfile,
+  normalizePersonaProfile,
+  postProcessPersonaReply,
+  retrievePersonaContext
+} from "./personaEngine.js";
+import { initializeDatabase } from "./db/index.js";
+import {
+  buildPersonaProfileFromWhatsApp,
+  getWhatsAppParticipants,
+  parseWhatsAppChat
+} from "./whatsappPersona.js";
 
 const backendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
+// Initialize database
+const db = initializeDatabase();
+
 loadEnvFile(path.join(backendDirectory, ".env"));
 
-app.use(cors());
-app.use(express.json());
+app.use(
+  cors({
+    origin: true,
+    credentials: true
+  })
+);
+app.use(express.json({ limit: "10mb" }));
 
 const port = Number(process.env.PORT ?? 5000);
 const liveAvatarApiKey = process.env.LIVEAVATAR_API_KEY ?? process.env.HEYGEN_API_KEY;
+const personaProfilePath = process.env.PERSONA_PROFILE_PATH;
+const personaHistoryTurns = Number(process.env.PERSONA_HISTORY_TURNS ?? 6);
+const personaMaxContextItems = Number(process.env.PERSONA_MAX_CONTEXT_ITEMS ?? 6);
+const personaSharedConversationCount = Number(process.env.PERSONA_SHARED_CONVERSATIONS ?? 3);
+const personaSharedConversationTurns = Number(process.env.PERSONA_SHARED_CONVERSATION_TURNS ?? 4);
+const sessionSecret = process.env.SESSION_SECRET ?? "local-dev-persona-session-secret";
+const userSessionCookieName = "persona_user_session";
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) {
@@ -67,6 +100,299 @@ function isJwtLike(value) {
   return typeof value === "string" && value.split(".").length === 3;
 }
 
+function getBasePersonaProfile() {
+  return loadPersonaProfile(backendDirectory, personaProfilePath);
+}
+
+function getUserPersonaState(userId) {
+  const profile = db.getUserProfile(userId);
+  const preferences = profile.preferences ?? {};
+  const savedPersona = preferences.persona;
+
+  if (savedPersona?.profile && typeof savedPersona.profile === "object") {
+    return {
+      isConfigured: true,
+      source: savedPersona.source ?? "whatsapp-import",
+      selectedPerson: savedPersona.selectedPerson ?? savedPersona.profile.person?.name ?? "",
+      profile: normalizePersonaProfile(savedPersona.profile, "user-preferences")
+    };
+  }
+
+  return {
+    isConfigured: false,
+    source: "default",
+    selectedPerson: "",
+    profile: getBasePersonaProfile()
+  };
+}
+
+function saveUserPersona(userId, selectedPerson, rawProfile) {
+  const currentProfile = db.getUserProfile(userId);
+  const nextPreferences = {
+    ...(currentProfile.preferences ?? {}),
+    persona: {
+      source: "whatsapp-import",
+      selectedPerson,
+      configuredAt: new Date().toISOString(),
+      profile: rawProfile
+    }
+  };
+
+  db.updateUserPreferences(userId, nextPreferences);
+  return getUserPersonaState(userId);
+}
+
+function clearUserPersona(userId) {
+  const currentProfile = db.getUserProfile(userId);
+  const nextPreferences = { ...(currentProfile.preferences ?? {}) };
+  delete nextPreferences.persona;
+  db.updateUserPreferences(userId, nextPreferences);
+}
+
+function buildPersonaResponse(personaState) {
+  return {
+    configured: personaState.isConfigured,
+    source: personaState.source,
+    selectedPerson: personaState.selectedPerson,
+    name: personaState.profile.person.name,
+    role: personaState.profile.person.role,
+    summary: personaState.profile.person.summary,
+    sourcePath: personaState.profile.sourcePath
+  };
+}
+
+function parseCookies(cookieHeader) {
+  const cookies = {};
+
+  if (!cookieHeader) {
+    return cookies;
+  }
+
+  for (const part of cookieHeader.split(";")) {
+    const separatorIndex = part.indexOf("=");
+
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = part.slice(0, separatorIndex).trim();
+    const value = part.slice(separatorIndex + 1).trim();
+
+    if (!key) {
+      continue;
+    }
+
+    cookies[key] = decodeURIComponent(value);
+  }
+
+  return cookies;
+}
+
+function signSessionValue(value) {
+  return crypto.createHmac("sha256", sessionSecret).update(value).digest("base64url");
+}
+
+function isValidSignedValue(value, signature) {
+  if (!value || !signature) {
+    return false;
+  }
+
+  const expected = signSessionValue(value);
+  const left = Buffer.from(signature);
+  const right = Buffer.from(expected);
+
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function setUserSessionCookie(res, userId) {
+  const payload = `${userId}.${signSessionValue(userId)}`;
+  res.cookie(userSessionCookieName, payload, {
+    httpOnly: true,
+    path: "/",
+    sameSite: "lax"
+  });
+}
+
+function getUserId(req, res) {
+  const cookies = parseCookies(req.headers.cookie);
+  const sessionCookie = cookies[userSessionCookieName];
+
+  if (sessionCookie) {
+    const separatorIndex = sessionCookie.lastIndexOf(".");
+
+    if (separatorIndex !== -1) {
+      const userId = sessionCookie.slice(0, separatorIndex);
+      const signature = sessionCookie.slice(separatorIndex + 1);
+
+      if (isValidSignedValue(userId, signature)) {
+        return userId;
+      }
+    }
+  }
+
+  const userId = crypto.randomUUID();
+  setUserSessionCookie(res, userId);
+  return userId;
+}
+
+function getOrCreateConversation(db, userId, conversationId) {
+  if (!conversationId || typeof conversationId !== "string" || !conversationId.trim()) {
+    return db.createConversation(userId);
+  }
+
+  const normalizedConversationId = conversationId.trim();
+  const conversation = db.getConversation(normalizedConversationId, userId);
+
+  if (!conversation) {
+    return db.createConversation(userId);
+  }
+
+  return conversation;
+}
+
+function updateConversationTitle(db, userId, conversationId) {
+  const conversation = db.getConversation(conversationId, userId);
+
+  const shouldAutoTitle =
+    conversation &&
+    (!conversation.title || ["Untitled", "New Conversation"].includes(conversation.title.trim()));
+
+  if (!shouldAutoTitle) {
+    return;
+  }
+
+  const firstUserMessage = (conversation.messages || []).find((message) => message.role === "user");
+
+  if (!firstUserMessage) {
+    return;
+  }
+
+  const words = firstUserMessage.content.split(/\s+/);
+  const title = words.slice(0, 8).join(" ");
+  db.updateConversationTitle(conversationId, userId, title);
+}
+
+function compactWhitespace(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function truncateText(value, maxLength = 220) {
+  const normalized = compactWhitespace(value);
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}...`;
+}
+
+function formatConversationUpdatedAt(value) {
+  return value ? new Date(value).toISOString().slice(0, 10) : "unknown";
+}
+
+function getConversationDisplayTitle(value) {
+  return compactWhitespace(value) || "Untitled";
+}
+
+function formatConversationMemories(memories) {
+  if (!Array.isArray(memories) || memories.length === 0) {
+    return "None.";
+  }
+
+  return memories
+    .map((conversation, index) => {
+      const title = getConversationDisplayTitle(conversation.title);
+      const updatedAt = formatConversationUpdatedAt(conversation.updated_at);
+      const transcript = conversation.messages
+        .map(
+          (message) =>
+            `${message.role === "user" ? "User" : "Assistant"}: ${truncateText(message.content)}`
+        )
+        .join("\n");
+
+      return `Conversation ${index + 1} | ${title} | updated ${updatedAt}\n${transcript}`;
+    })
+    .join("\n\n");
+}
+
+function buildConversationMemoryPrompt(memories) {
+  if (!Array.isArray(memories) || memories.length === 0) {
+    return "";
+  }
+
+  return `
+Cross-chat memory from this same user:
+- These snippets come from earlier conversations with the same user.
+- Use them when the user refers to something discussed in another chat or asks what you remember from previous chats.
+- Only claim to remember details that are supported by these snippets.
+- If the snippets are insufficient, say so naturally instead of pretending to remember.
+
+Earlier conversation snippets:
+${formatConversationMemories(memories)}
+`.trim();
+}
+
+function formatPriorChats(memories) {
+  return memories.map((conversation) => {
+    const title = getConversationDisplayTitle(conversation.title);
+    const updatedAt = formatConversationUpdatedAt(conversation.updated_at);
+    return `${title} (${updatedAt})`;
+  });
+}
+
+function buildGroundingPayload(retrievedContext, sharedConversationMemories) {
+  return {
+    ...getGroundingSummary(retrievedContext),
+    priorChats: formatPriorChats(sharedConversationMemories)
+  };
+}
+
+function buildSystemPrompt(profile, retrievedContext, messageNeed, sharedConversationMemories) {
+  const customSystemPrompt = process.env.GROQ_SYSTEM_PROMPT?.trim();
+
+  return [
+    buildPersonaPrompt(profile, retrievedContext, messageNeed),
+    buildConversationMemoryPrompt(sharedConversationMemories),
+    customSystemPrompt ? `Additional runtime instructions:\n${customSystemPrompt}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildGroqMessages(systemPrompt, recentMessages, userMessage) {
+  return [
+    {
+      role: "system",
+      content: systemPrompt
+    },
+    ...recentMessages,
+    { role: "user", content: userMessage }
+  ];
+}
+
+function saveConversationReply(db, userId, conversationId, userMessage, reply) {
+  db.addMessage(conversationId, "user", userMessage);
+  db.addMessage(conversationId, "assistant", reply);
+  updateConversationTitle(db, userId, conversationId);
+}
+
+function buildChatSuccessResponse({
+  reply,
+  conversationId,
+  userId,
+  profile,
+  retrievedContext,
+  sharedConversationMemories
+}) {
+  return {
+    reply,
+    conversationId,
+    userId,
+    personaName: profile.person.name,
+    grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories)
+  };
+}
+
 async function parseError(response) {
   const rawText = await response.text();
 
@@ -77,8 +403,194 @@ async function parseError(response) {
   }
 }
 
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "ai-avatar-backend",
+    message: "Backend server is running.",
+    frontendUrl: "http://localhost:5173",
+    healthUrl: "/health",
+    api: {
+      persona: "/api/persona",
+      bootstrap: "/api/persona/bootstrap",
+      conversations: "/api/conversations",
+      chat: "/api/chat",
+      liveAvatarSessionToken: "/api/heygen/session-token"
+    }
+  });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/persona", (req, res) => {
+  const userId = getUserId(req, res);
+  const personaState = getUserPersonaState(userId);
+
+  res.json(buildPersonaResponse(personaState));
+});
+
+app.get("/api/persona/bootstrap", (req, res) => {
+  const userId = getUserId(req, res);
+  const personaState = getUserPersonaState(userId);
+
+  res.json({
+    userId,
+    requiresSetup: !personaState.isConfigured,
+    persona: buildPersonaResponse(personaState)
+  });
+});
+
+app.post("/api/persona/preview-whatsapp", (req, res) => {
+  const userId = getUserId(req, res);
+  const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
+  const messages = parseWhatsAppChat(chatText);
+  const participants = getWhatsAppParticipants(messages);
+
+  if (messages.length === 0 || participants.length === 0) {
+    return res.status(400).json({
+      error: "Could not find WhatsApp messages in that text file."
+    });
+  }
+
+  return res.json({
+    userId,
+    participantCount: participants.length,
+    messageCount: messages.length,
+    participants
+  });
+});
+
+app.post("/api/persona/configure-whatsapp", (req, res) => {
+  const userId = getUserId(req, res);
+  const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
+  const selectedPerson = typeof req.body?.selectedPerson === "string" ? req.body.selectedPerson.trim() : "";
+  const messages = parseWhatsAppChat(chatText);
+
+  if (!selectedPerson) {
+    return res.status(400).json({ error: "Selected person is required." });
+  }
+
+  if (messages.length === 0) {
+    return res.status(400).json({
+      error: "Could not find WhatsApp messages in that text file."
+    });
+  }
+
+  try {
+    const rawProfile = buildPersonaProfileFromWhatsApp(messages, selectedPerson);
+    const personaState = saveUserPersona(userId, selectedPerson, rawProfile);
+
+    return res.json({
+      userId,
+      persona: buildPersonaResponse(personaState)
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : "Unable to create a persona from that chat."
+    });
+  }
+});
+
+app.delete("/api/persona", (req, res) => {
+  const userId = getUserId(req, res);
+  clearUserPersona(userId);
+
+  return res.json({
+    ok: true,
+    persona: buildPersonaResponse(getUserPersonaState(userId))
+  });
+});
+
+// Conversation management endpoints
+app.get("/api/conversations", (req, res) => {
+  const userId = getUserId(req, res);
+
+  try {
+    const conversations = db.getUserConversations(userId);
+
+    return res.json({
+      userId,
+      conversations
+    });
+  } catch (error) {
+    console.error("Error fetching conversations:", error);
+    return res.status(500).json({ error: "Failed to fetch conversations." });
+  }
+});
+
+app.get("/api/conversations/:id", (req, res) => {
+  const userId = getUserId(req, res);
+  const { id } = req.params;
+
+  try {
+    const conversation = db.getConversation(id, userId);
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    return res.json(conversation);
+  } catch (error) {
+    console.error("Error fetching conversation:", error);
+    return res.status(500).json({ error: "Failed to fetch conversation." });
+  }
+});
+
+app.post("/api/conversations", (req, res) => {
+  const userId = getUserId(req, res);
+  const { title } = req.body ?? {};
+
+  try {
+    const conversation = db.createConversation(userId, title || "Untitled");
+
+    return res.json(conversation);
+  } catch (error) {
+    console.error("Error creating conversation:", error);
+    return res.status(500).json({ error: "Failed to create conversation." });
+  }
+});
+
+app.put("/api/conversations/:id", (req, res) => {
+  const userId = getUserId(req, res);
+  const { id } = req.params;
+  const { title } = req.body ?? {};
+
+  if (!title) {
+    return res.status(400).json({ error: "Title is required." });
+  }
+
+  try {
+    const updated = db.updateConversationTitle(id, userId, title);
+
+    if (!updated) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    return res.json(updated);
+  } catch (error) {
+    console.error("Error updating conversation:", error);
+    return res.status(500).json({ error: "Failed to update conversation." });
+  }
+});
+
+app.delete("/api/conversations/:id", (req, res) => {
+  const userId = getUserId(req, res);
+  const { id } = req.params;
+
+  try {
+    const success = db.archiveConversation(id, userId);
+
+    if (!success) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    return res.json({ success: true, conversationId: id });
+  } catch (error) {
+    console.error("Error deleting conversation:", error);
+    return res.status(500).json({ error: "Failed to delete conversation." });
+  }
 });
 
 app.post("/api/heygen/session-token", async (_req, res) => {
@@ -144,6 +656,8 @@ app.post("/api/heygen/session-token", async (_req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   const userMessage = req.body?.message?.trim();
+  const conversationId = req.body?.conversationId;
+  const userId = getUserId(req, res);
 
   if (!userMessage) {
     return res.status(400).json({ error: "Message is required." });
@@ -156,6 +670,59 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
+    // Ensure user profile exists
+    db.getUserProfile(userId);
+
+    // Get or create conversation
+    const conversation = getOrCreateConversation(db, userId, conversationId);
+    const convId = conversation.id;
+
+    // Get recent message history from database
+    const recentMessages = db.getRecentMessages(convId, personaHistoryTurns);
+    const sharedConversationMemories = db.getRecentConversationMemories(
+      userId,
+      convId,
+      personaSharedConversationCount,
+      personaSharedConversationTurns
+    );
+
+    const personaState = getUserPersonaState(userId);
+    const profile = personaState.profile;
+    const retrievedContext = retrievePersonaContext(
+      profile,
+      userMessage,
+      personaMaxContextItems
+    );
+    const messageNeed = analyzePersonaReplyNeed(userMessage, recentMessages);
+    const deterministicReply = buildDeterministicPersonaReply(userMessage, recentMessages);
+    const heuristicReply = profile.defaults.enableHeuristicReplies
+      ? buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext)
+      : "";
+
+    if (deterministicReply || heuristicReply) {
+      const finalReply = deterministicReply || heuristicReply;
+      saveConversationReply(db, userId, convId, userMessage, finalReply);
+
+      return res.json(
+        buildChatSuccessResponse({
+          reply: finalReply,
+          conversationId: convId,
+          userId,
+          profile,
+          retrievedContext,
+          sharedConversationMemories
+        })
+      );
+    }
+
+    const systemPrompt = buildSystemPrompt(
+      profile,
+      retrievedContext,
+      messageNeed,
+      sharedConversationMemories
+    );
+    const messages = buildGroqMessages(systemPrompt, recentMessages, userMessage);
+
     const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -164,16 +731,8 @@ app.post("/api/chat", async (req, res) => {
       },
       body: JSON.stringify({
         model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
-        messages: [
-          {
-            role: "system",
-            content:
-              process.env.GROQ_SYSTEM_PROMPT ??
-              "You are a concise, friendly AI avatar assistant."
-          },
-          { role: "user", content: userMessage }
-        ],
-        temperature: 0.7,
+        messages,
+        temperature: profile.defaults.temperature ?? 0.7,
         stream: false
       })
     });
@@ -186,7 +745,8 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const data = await response.json();
-    const reply = data?.choices?.[0]?.message?.content?.trim();
+    const rawReply = data?.choices?.[0]?.message?.content?.trim();
+    const reply = postProcessPersonaReply(rawReply, retrievedContext);
 
     if (!reply) {
       return res.status(502).json({
@@ -194,7 +754,18 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    return res.json({ reply });
+    saveConversationReply(db, userId, convId, userMessage, reply);
+
+    return res.json(
+      buildChatSuccessResponse({
+        reply,
+        conversationId: convId,
+        userId,
+        profile,
+        retrievedContext,
+        sharedConversationMemories
+      })
+    );
   } catch (error) {
     console.error("Groq chat error:", error);
 

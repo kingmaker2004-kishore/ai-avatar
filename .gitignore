@@ -15,6 +15,9 @@ dist-ssr
 .env.*
 !.env.example
 !backend/.env.example
+backend/data/chat.db
+backend/data/chat.db-shm
+backend/data/chat.db-wal
 
 # Editor directories and files
 .vscode/*
