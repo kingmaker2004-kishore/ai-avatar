@@ -77,6 +77,18 @@ class ChatDatabase {
   }
 
   /**
+   * Get all user profiles with parsed preferences
+   */
+  getAllUserProfiles() {
+    const stmt = this.db.prepare("SELECT * FROM user_profiles ORDER BY updated_at DESC");
+
+    return stmt.all().map((profile) => ({
+      ...profile,
+      preferences: parsePreferences(profile.preferences)
+    }));
+  }
+
+  /**
    * Get or create a conversation
    */
   getOrCreateConversation(conversationId, userId, title = null) {

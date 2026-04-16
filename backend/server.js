@@ -9,15 +9,18 @@ import {
   buildDeterministicPersonaReply,
   buildHeuristicPersonaReply,
   buildPersonaPrompt,
+  createFallbackPersonaProfile,
   getGroundingSummary,
   loadPersonaProfile,
   normalizePersonaProfile,
   postProcessPersonaReply,
+  resolveProfilePath,
   retrievePersonaContext
 } from "./personaEngine.js";
 import { initializeDatabase } from "./db/index.js";
 import {
   buildPersonaProfileFromWhatsApp,
+  enrichImportedPersonaProfile,
   getWhatsAppParticipants,
   parseWhatsAppChat
 } from "./whatsappPersona.js";
@@ -104,17 +107,160 @@ function getBasePersonaProfile() {
   return loadPersonaProfile(backendDirectory, personaProfilePath);
 }
 
+function getBasePersonaProfilePath() {
+  return resolveProfilePath(backendDirectory, personaProfilePath);
+}
+
+function writeBasePersonaProfile(rawProfile) {
+  const resolvedPath = getBasePersonaProfilePath();
+  const directory = path.dirname(resolvedPath);
+
+  if (!fs.existsSync(directory)) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+
+  fs.writeFileSync(resolvedPath, `${JSON.stringify(rawProfile, null, 2)}\n`, "utf8");
+}
+
+function serializeProfile(value) {
+  return JSON.stringify(value ?? null);
+}
+
+function upgradeImportedPersonaProfile(rawProfile) {
+  const upgradedProfile = enrichImportedPersonaProfile(rawProfile);
+
+  return {
+    profile: upgradedProfile,
+    changed: serializeProfile(rawProfile) !== serializeProfile(upgradedProfile)
+  };
+}
+
+function readBasePersonaRawProfile() {
+  const resolvedPath = getBasePersonaProfilePath();
+
+  if (!fs.existsSync(resolvedPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(resolvedPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function getConfiguredBasePersonaProfile() {
+  const rawBaseProfile = readBasePersonaRawProfile();
+
+  if (!rawBaseProfile || typeof rawBaseProfile !== "object") {
+    return getBasePersonaProfile();
+  }
+
+  const normalizedBase = normalizePersonaProfile(rawBaseProfile, getBasePersonaProfilePath());
+
+  if (isNeutralFallbackProfile(normalizedBase)) {
+    return normalizedBase;
+  }
+
+  const { profile: upgradedBaseProfile, changed } = upgradeImportedPersonaProfile(rawBaseProfile);
+
+  if (changed) {
+    writeBasePersonaProfile(upgradedBaseProfile);
+  }
+
+  return normalizePersonaProfile(upgradedBaseProfile, getBasePersonaProfilePath());
+}
+
+function isNeutralFallbackProfile(profile) {
+  return (
+    profile.person.name === "Persona Avatar" &&
+    profile.person.role === "trusted companion" &&
+    profile.knowledgeBase.length === 0 &&
+    profile.memoryVideos.length === 0 &&
+    profile.chatExamples.length === 0 &&
+    profile.styleSamples.length === 0
+  );
+}
+
+function migrateSavedWhatsAppPersonas() {
+  const userProfiles = db.getAllUserProfiles();
+  let migratedCount = 0;
+
+  for (const userProfile of userProfiles) {
+    const preferences = userProfile.preferences ?? {};
+    const savedPersona = preferences.persona;
+
+    if (
+      savedPersona?.source !== "whatsapp-import" ||
+      !savedPersona.profile ||
+      typeof savedPersona.profile !== "object"
+    ) {
+      continue;
+    }
+
+    const { profile: upgradedProfile, changed } = upgradeImportedPersonaProfile(savedPersona.profile);
+
+    if (!changed) {
+      continue;
+    }
+
+    db.updateUserPreferences(userProfile.id, {
+      ...preferences,
+      persona: {
+        ...savedPersona,
+        profile: upgradedProfile
+      }
+    });
+    migratedCount += 1;
+  }
+
+  return migratedCount;
+}
+
 function getUserPersonaState(userId) {
   const profile = db.getUserProfile(userId);
   const preferences = profile.preferences ?? {};
   const savedPersona = preferences.persona;
 
   if (savedPersona?.profile && typeof savedPersona.profile === "object") {
+    const {
+      profile: upgradedSavedProfile,
+      changed: savedProfileChanged
+    } =
+      savedPersona.source === "whatsapp-import"
+        ? upgradeImportedPersonaProfile(savedPersona.profile)
+        : { profile: savedPersona.profile, changed: false };
+
+    if (savedProfileChanged) {
+      const upgradedPreferences = {
+        ...preferences,
+        persona: {
+          ...savedPersona,
+          profile: upgradedSavedProfile
+        }
+      };
+
+      db.updateUserPreferences(userId, upgradedPreferences);
+      writeBasePersonaProfile(upgradedSavedProfile);
+    }
+
     return {
       isConfigured: true,
       source: savedPersona.source ?? "whatsapp-import",
-      selectedPerson: savedPersona.selectedPerson ?? savedPersona.profile.person?.name ?? "",
-      profile: normalizePersonaProfile(savedPersona.profile, "user-preferences")
+      selectedPerson: savedPersona.selectedPerson ?? upgradedSavedProfile.person?.name ?? "",
+      profile: normalizePersonaProfile(upgradedSavedProfile, "user-preferences")
+    };
+  }
+
+  const baseProfile = getConfiguredBasePersonaProfile();
+  const hasConfiguredBaseProfile = !isNeutralFallbackProfile(baseProfile);
+
+  if (hasConfiguredBaseProfile) {
+    return {
+      isConfigured: true,
+      source: "persona-profile",
+      selectedPerson: baseProfile.person.name,
+      profile: baseProfile
     };
   }
 
@@ -122,11 +268,12 @@ function getUserPersonaState(userId) {
     isConfigured: false,
     source: "default",
     selectedPerson: "",
-    profile: getBasePersonaProfile()
+    profile: baseProfile
   };
 }
 
 function saveUserPersona(userId, selectedPerson, rawProfile) {
+  const { profile: upgradedProfile } = upgradeImportedPersonaProfile(rawProfile);
   const currentProfile = db.getUserProfile(userId);
   const nextPreferences = {
     ...(currentProfile.preferences ?? {}),
@@ -134,10 +281,11 @@ function saveUserPersona(userId, selectedPerson, rawProfile) {
       source: "whatsapp-import",
       selectedPerson,
       configuredAt: new Date().toISOString(),
-      profile: rawProfile
+      profile: upgradedProfile
     }
   };
 
+  writeBasePersonaProfile(upgradedProfile);
   db.updateUserPreferences(userId, nextPreferences);
   return getUserPersonaState(userId);
 }
@@ -146,6 +294,7 @@ function clearUserPersona(userId) {
   const currentProfile = db.getUserProfile(userId);
   const nextPreferences = { ...(currentProfile.preferences ?? {}) };
   delete nextPreferences.persona;
+  writeBasePersonaProfile(createFallbackPersonaProfile());
   db.updateUserPreferences(userId, nextPreferences);
 }
 
@@ -159,6 +308,12 @@ function buildPersonaResponse(personaState) {
     summary: personaState.profile.person.summary,
     sourcePath: personaState.profile.sourcePath
   };
+}
+
+const migratedSavedPersonaCount = migrateSavedWhatsAppPersonas();
+
+if (migratedSavedPersonaCount > 0) {
+  console.log(`Migrated ${migratedSavedPersonaCount} saved WhatsApp persona profiles.`);
 }
 
 function parseCookies(cookieHeader) {

@@ -27,14 +27,39 @@ const FALLBACK_PROFILE = {
     "When the retrieved context is weak, answer carefully and admit uncertainty in a natural way.",
     "Prioritize factual consistency over flashy wording."
   ],
+  personality_traits: {
+    humor: 0.3,
+    confidence: 0.45,
+    empathy: 0.35,
+    directness: 0.5,
+    verbosity: 0.35
+  },
+  conversation_habits: {
+    greetings: [],
+    closings: [],
+    abbreviations: [],
+    acknowledgement_patterns: [],
+    response_style: [],
+    punctuation_style: {
+      exclamation: "light",
+      questions: "medium",
+      ellipsis: "light"
+    },
+    emoji_style: "rare"
+  },
   knowledge_base: [],
   memory_videos: [],
+  situation_responses: [],
   chat_examples: [],
   defaults: {
     temperature: 0.65,
     enable_heuristic_replies: true
   }
 };
+
+export function createFallbackPersonaProfile() {
+  return JSON.parse(JSON.stringify(FALLBACK_PROFILE));
+}
 
 function toArray(value) {
   return Array.isArray(value) ? value : [];
@@ -46,6 +71,12 @@ function toText(value, fallback = "") {
 
 function unique(items) {
   return [...new Set(items.filter(Boolean))];
+}
+
+function toScore(value, fallback = 0) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(1, Number(value.toFixed(2))))
+    : fallback;
 }
 
 const STOP_WORDS = new Set([
@@ -71,7 +102,6 @@ const STOP_WORDS = new Set([
   "do",
   "does",
   "for",
-  "free",
   "from",
   "get",
   "going",
@@ -122,8 +152,6 @@ const STOP_WORDS = new Set([
   "there",
   "this",
   "to",
-  "today",
-  "tomorrow",
   "up",
   "use",
   "was",
@@ -209,6 +237,39 @@ function tokenize(value) {
       .split(/[^a-z0-9]+/i)
       .filter((token) => token.length > 2 && !STOP_WORDS.has(token))
   );
+}
+
+function buildRetrievalTokens(userMessage, messageIntents) {
+  const tokens = tokenize(userMessage);
+
+  if (tokens.length > 0) {
+    return tokens;
+  }
+
+  const normalized = expandColloquialText(userMessage);
+  const fallbackTokens = [];
+
+  if (hasKeyword(normalized, ["free", "available"])) {
+    fallbackTokens.push("free", "available", "time");
+  }
+
+  if (hasKeyword(normalized, ["today"])) {
+    fallbackTokens.push("today");
+  }
+
+  if (hasKeyword(normalized, ["tomorrow"])) {
+    fallbackTokens.push("tomorrow");
+  }
+
+  if (messageIntents.includes("scheduling")) {
+    fallbackTokens.push("schedule", "timing");
+  }
+
+  if (messageIntents.includes("casual")) {
+    fallbackTokens.push("casual");
+  }
+
+  return unique(fallbackTokens.filter((token) => token.length > 2));
 }
 
 function scoreText(queryTokens, value) {
@@ -684,6 +745,69 @@ export function normalizePersonaProfile(rawProfile, resolvedPath = "runtime") {
         ...toArray(rawProfile?.person?.do_not_do).map((item) => toText(item)).filter(Boolean)
       ])
     },
+    personalityTraits: {
+      humor: toScore(
+        rawProfile?.personality_traits?.humor,
+        FALLBACK_PROFILE.personality_traits.humor
+      ),
+      confidence: toScore(
+        rawProfile?.personality_traits?.confidence,
+        FALLBACK_PROFILE.personality_traits.confidence
+      ),
+      empathy: toScore(
+        rawProfile?.personality_traits?.empathy,
+        FALLBACK_PROFILE.personality_traits.empathy
+      ),
+      directness: toScore(
+        rawProfile?.personality_traits?.directness,
+        FALLBACK_PROFILE.personality_traits.directness
+      ),
+      verbosity: toScore(
+        rawProfile?.personality_traits?.verbosity,
+        FALLBACK_PROFILE.personality_traits.verbosity
+      )
+    },
+    conversationHabits: {
+      greetings: unique(
+        toArray(rawProfile?.conversation_habits?.greetings).map((item) => toText(item)).filter(Boolean)
+      ),
+      closings: unique(
+        toArray(rawProfile?.conversation_habits?.closings).map((item) => toText(item)).filter(Boolean)
+      ),
+      abbreviations: unique(
+        toArray(rawProfile?.conversation_habits?.abbreviations)
+          .map((item) => toText(item))
+          .filter(Boolean)
+      ),
+      acknowledgementPatterns: unique(
+        toArray(rawProfile?.conversation_habits?.acknowledgement_patterns)
+          .map((item) => toText(item))
+          .filter(Boolean)
+      ),
+      responseStyle: unique(
+        toArray(rawProfile?.conversation_habits?.response_style)
+          .map((item) => toText(item))
+          .filter(Boolean)
+      ),
+      punctuationStyle: {
+        exclamation: toText(
+          rawProfile?.conversation_habits?.punctuation_style?.exclamation,
+          FALLBACK_PROFILE.conversation_habits.punctuation_style.exclamation
+        ),
+        questions: toText(
+          rawProfile?.conversation_habits?.punctuation_style?.questions,
+          FALLBACK_PROFILE.conversation_habits.punctuation_style.questions
+        ),
+        ellipsis: toText(
+          rawProfile?.conversation_habits?.punctuation_style?.ellipsis,
+          FALLBACK_PROFILE.conversation_habits.punctuation_style.ellipsis
+        )
+      },
+      emojiStyle: toText(
+        rawProfile?.conversation_habits?.emoji_style,
+        FALLBACK_PROFILE.conversation_habits.emoji_style
+      )
+    },
     behaviorRules: unique([
       ...FALLBACK_PROFILE.behavior_rules,
       ...toArray(rawProfile?.behavior_rules).map((item) => toText(item)).filter(Boolean)
@@ -692,7 +816,11 @@ export function normalizePersonaProfile(rawProfile, resolvedPath = "runtime") {
       id: toText(item?.id, `fact-${index + 1}`),
       title: toText(item?.title, `Fact ${index + 1}`),
       content: toText(item?.content),
-      tags: unique(toArray(item?.tags).map((tag) => toText(tag)).filter(Boolean))
+      tags: unique(toArray(item?.tags).map((tag) => toText(tag)).filter(Boolean)),
+      personalSignificance: toText(item?.personal_significance),
+      expertiseLevel: toText(item?.expertise_level),
+      emotionalTone: toText(item?.emotional_tone),
+      frequency: toText(item?.frequency)
     })),
     memoryVideos: toArray(rawProfile?.memory_videos).map((item, index) => ({
       id: toText(item?.id, `memory-${index + 1}`),
@@ -704,13 +832,35 @@ export function normalizePersonaProfile(rawProfile, resolvedPath = "runtime") {
         toArray(item?.transcript_snippets).map((snippet) => toText(snippet)).filter(Boolean)
       )
     })),
+    situationResponses: toArray(rawProfile?.situation_responses).map((item, index) => ({
+      id: toText(item?.id, `situation-${index + 1}`),
+      title: toText(item?.title, `Situation ${index + 1}`),
+      summary: toText(item?.summary),
+      guidance: toText(item?.guidance),
+      commonCharacteristics: unique(
+        toArray(item?.common_characteristics).map((entry) => toText(entry)).filter(Boolean)
+      ),
+      personalityTraitsShown: unique(
+        toArray(item?.personality_traits_shown).map((entry) => toText(entry)).filter(Boolean)
+      ),
+      exampleIds: unique(toArray(item?.example_ids).map((entry) => toText(entry)).filter(Boolean)),
+      frequency: toText(item?.frequency)
+    })),
     chatExamples: toArray(rawProfile?.chat_examples).map((item, index) => ({
       id: toText(item?.id, `example-${index + 1}`),
       user: toText(item?.user),
       assistant: toText(item?.assistant),
       notes: toText(item?.notes),
       tags: unique(toArray(item?.tags).map((tag) => toText(tag)).filter(Boolean)),
-      intents: unique(toArray(item?.intents).map((intent) => toText(intent)).filter(Boolean))
+      intents: unique(toArray(item?.intents).map((intent) => toText(intent)).filter(Boolean)),
+      situationType: toText(item?.situation_type),
+      responseCharacteristics: unique(
+        toArray(item?.response_characteristics).map((entry) => toText(entry)).filter(Boolean)
+      ),
+      personalityTraitsShown: unique(
+        toArray(item?.personality_traits_shown).map((entry) => toText(entry)).filter(Boolean)
+      ),
+      contextRichness: toText(item?.context_richness, "single-turn")
     })),
     styleSamples: unique(
       toArray(rawProfile?.style_samples)
@@ -771,7 +921,110 @@ function countIntentOverlap(left, right) {
   return left.reduce((total, item) => total + (rightSet.has(item) ? 1 : 0), 0);
 }
 
-function scoreExampleMatch(item, queryTokens, messageIntents) {
+function getDominantPersonalityTraits(profile) {
+  return Object.entries(profile.personalityTraits ?? {})
+    .filter(([, score]) => typeof score === "number" && score >= 0.55)
+    .sort((left, right) => right[1] - left[1])
+    .map(([trait]) => trait)
+    .slice(0, 3);
+}
+
+function detectSituationType(userMessage) {
+  const normalized = expandColloquialText(userMessage);
+
+  if (
+    hasKeyword(normalized, [
+      "sorry",
+      "failed",
+      "not working",
+      "late",
+      "can't",
+      "cannot",
+      "unable",
+      "mistake",
+      "missed"
+    ])
+  ) {
+    return "bad-news";
+  }
+
+  if (
+    hasKeyword(normalized, ["done", "completed", "finished", "selected", "won", "success", "finally"])
+  ) {
+    return "celebration";
+  }
+
+  if (hasKeyword(normalized, ["error", "issue", "problem", "bug", "fix", "stuck", "help"])) {
+    return "problem-solving";
+  }
+
+  if (
+    hasKeyword(normalized, [
+      "free",
+      "available",
+      "time",
+      "today",
+      "tomorrow",
+      "morning",
+      "evening",
+      "call",
+      "connect",
+      "meet"
+    ])
+  ) {
+    return "scheduling";
+  }
+
+  if (
+    hasKeyword(normalized, [
+      "please",
+      "send",
+      "share",
+      "check",
+      "help me",
+      "can you",
+      "could you",
+      "come"
+    ])
+  ) {
+    return "request";
+  }
+
+  if (/^(what|why|when|where|who|how)\b/i.test(toText(userMessage)) || normalized.includes("?")) {
+    return "question";
+  }
+
+  return "general-chat";
+}
+
+function scoreSituationMatch(item, queryTokens, currentSituation, messageIntents) {
+  let score = 0;
+
+  if (item.id === currentSituation) {
+    score += 8;
+  }
+
+  score += scoreText(queryTokens, `${item.title} ${item.summary} ${item.guidance}`);
+  score += scoreTags(queryTokens, item.commonCharacteristics);
+  score += countIntentOverlap(messageIntents, item.commonCharacteristics) * 2;
+
+  if (item.frequency === "high") {
+    score += 2;
+  } else if (item.frequency === "medium") {
+    score += 1;
+  }
+
+  return score;
+}
+
+function scoreExampleMatch(
+  item,
+  queryTokens,
+  messageIntents,
+  detectedTopic = "",
+  currentSituation = "",
+  dominantTraits = []
+) {
   const userScore = scoreText(queryTokens, item.user) * 4;
   const assistantScore = scoreText(queryTokens, item.assistant) * 2;
   const notesScore = scoreText(queryTokens, item.notes);
@@ -802,6 +1055,29 @@ function scoreExampleMatch(item, queryTokens, messageIntents) {
     score += 4;
   }
 
+  if (currentSituation && item.situationType === currentSituation) {
+    score += 7;
+  }
+
+  if (detectedTopic && itemTags.has(detectedTopic)) {
+    score += 6;
+  }
+
+  score += countIntentOverlap(dominantTraits, item.personalityTraitsShown ?? []) * 2;
+
+  if (
+    queryTokens.length <= 2 &&
+    itemTags.has("short-reply")
+  ) {
+    score += 4;
+  }
+
+  if (queryTokens.length >= 4 && item.contextRichness === "threaded") {
+    score += 3;
+  } else if (queryTokens.length >= 3 && item.contextRichness === "multi-turn") {
+    score += 2;
+  }
+
   if (
     queryTokens.length <= 2 &&
     !isWorkMessage &&
@@ -814,9 +1090,12 @@ function scoreExampleMatch(item, queryTokens, messageIntents) {
 }
 
 export function retrievePersonaContext(profile, userMessage, maxItems = 6) {
-  const queryTokens = tokenize(userMessage);
   const messageIntents = inferMessageIntents(userMessage);
+  const queryTokens = buildRetrievalTokens(userMessage, messageIntents);
   const shortReplyMode = shouldUseShortCasualMode(userMessage, messageIntents, queryTokens);
+  const detectedTopic = detectTopicFromText(userMessage);
+  const currentSituation = detectSituationType(userMessage);
+  const dominantTraits = getDominantPersonalityTraits(profile);
   const knowledgeMatches = rankItems(profile.knowledgeBase, queryTokens, (item, tokens) => {
     return scoreText(tokens, `${item.title} ${item.content}`) + scoreTags(tokens, item.tags);
   });
@@ -826,14 +1105,26 @@ export function retrievePersonaContext(profile, userMessage, maxItems = 6) {
       scoreTags(tokens, item.tags)
     );
   });
+  const situationMatches = rankItems(profile.situationResponses, queryTokens, (item, tokens) =>
+    scoreSituationMatch(item, tokens, currentSituation, messageIntents)
+  );
   const exampleMatches = rankItems(profile.chatExamples, queryTokens, (item, tokens) =>
-    scoreExampleMatch(item, tokens, messageIntents)
+    scoreExampleMatch(
+      item,
+      tokens,
+      messageIntents,
+      detectedTopic,
+      currentSituation,
+      dominantTraits
+    )
   );
 
   return {
     knowledge: knowledgeMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
     memories: memoryMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
+    situations: situationMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
     examples: exampleMatches.slice(0, Math.min(3, maxItems)).map((entry) => entry.item),
+    currentSituation,
     messageIntents,
     shortReplyMode
   };
@@ -952,7 +1243,11 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
   }
 
   if (hasKeyword(lowerMessage, ["free", "available"])) {
-    return "Try panlaam\nTime sollu";
+    if (hasKeyword(lowerMessage, ["today", "tomorrow"])) {
+      return "Enna plan?";
+    }
+
+    return "Time sollu";
   }
 
   return "";
@@ -962,13 +1257,76 @@ function formatList(items) {
   return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- None";
 }
 
+function formatTraitScore(score) {
+  if (score >= 0.75) {
+    return "very high";
+  }
+
+  if (score >= 0.55) {
+    return "high";
+  }
+
+  if (score >= 0.35) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function formatPersonalityTraits(personalityTraits) {
+  return [
+    `- Humor: ${formatTraitScore(personalityTraits.humor)} (${personalityTraits.humor})`,
+    `- Confidence: ${formatTraitScore(personalityTraits.confidence)} (${personalityTraits.confidence})`,
+    `- Empathy: ${formatTraitScore(personalityTraits.empathy)} (${personalityTraits.empathy})`,
+    `- Directness: ${formatTraitScore(personalityTraits.directness)} (${personalityTraits.directness})`,
+    `- Verbosity: ${formatTraitScore(personalityTraits.verbosity)} (${personalityTraits.verbosity})`
+  ].join("\n");
+}
+
+function formatConversationHabits(conversationHabits) {
+  return [
+    `- Response style: ${
+      conversationHabits.responseStyle.length > 0
+        ? conversationHabits.responseStyle.join(", ")
+        : "No strong pattern extracted"
+    }`,
+    `- Greetings: ${
+      conversationHabits.greetings.length > 0 ? conversationHabits.greetings.join(", ") : "none observed"
+    }`,
+    `- Closings: ${
+      conversationHabits.closings.length > 0 ? conversationHabits.closings.join(", ") : "none observed"
+    }`,
+    `- Abbreviations: ${
+      conversationHabits.abbreviations.length > 0
+        ? conversationHabits.abbreviations.join(", ")
+        : "none observed"
+    }`,
+    `- Acknowledgements: ${
+      conversationHabits.acknowledgementPatterns.length > 0
+        ? conversationHabits.acknowledgementPatterns.join(", ")
+        : "none observed"
+    }`,
+    `- Punctuation: exclamation ${conversationHabits.punctuationStyle.exclamation}, questions ${conversationHabits.punctuationStyle.questions}, ellipsis ${conversationHabits.punctuationStyle.ellipsis}`,
+    `- Emoji style: ${conversationHabits.emojiStyle}`
+  ].join("\n");
+}
+
 function formatKnowledge(knowledge) {
   if (knowledge.length === 0) {
     return "- None";
   }
 
   return knowledge
-    .map((item) => `- ${item.title}: ${item.content}${item.tags.length ? ` [tags: ${item.tags.join(", ")}]` : ""}`)
+    .map(
+      (item) =>
+        `- ${item.title}: ${item.content}${
+          item.tags.length ? ` [tags: ${item.tags.join(", ")}]` : ""
+        }${
+          item.personalSignificance ? ` [personal significance: ${item.personalSignificance}]` : ""
+        }${item.expertiseLevel ? ` [expertise: ${item.expertiseLevel}]` : ""}${
+          item.emotionalTone ? ` [tone: ${item.emotionalTone}]` : ""
+        }${item.frequency ? ` [frequency: ${item.frequency}]` : ""}`
+    )
     .join("\n");
 }
 
@@ -1002,6 +1360,29 @@ function formatExamples(examples) {
           item.notes ? `\n  Notes: ${item.notes}` : ""
         }${item.intents.length ? `\n  Intents: ${item.intents.join(", ")}` : ""}${
           item.tags.length ? `\n  Tags: ${item.tags.join(", ")}` : ""
+        }${item.situationType ? `\n  Situation: ${item.situationType}` : ""}${
+          item.responseCharacteristics.length
+            ? `\n  Response characteristics: ${item.responseCharacteristics.join(", ")}`
+            : ""
+        }${
+          item.personalityTraitsShown.length
+            ? `\n  Traits shown: ${item.personalityTraitsShown.join(", ")}`
+            : ""
+        }${item.contextRichness ? `\n  Context richness: ${item.contextRichness}` : ""}`
+    )
+    .join("\n");
+}
+
+function formatSituationResponses(situations, currentSituation) {
+  if (!Array.isArray(situations) || situations.length === 0) {
+    return "- None";
+  }
+
+  return situations
+    .map(
+      (item) =>
+        `- ${item.title}${item.id === currentSituation ? " [current match]" : ""}: ${item.summary}${
+          item.guidance ? ` Guidance: ${item.guidance}` : ""
         }`
     )
     .join("\n");
@@ -1062,9 +1443,19 @@ ${formatStyleSamples(profile.styleSamples)}
 Current user-message cues:
 ${formatList(retrievedContext.messageIntents)}
 
+Personality traits:
+${formatPersonalityTraits(profile.personalityTraits)}
+
+Conversation habits:
+${formatConversationHabits(profile.conversationHabits)}
+
+Situation guidance:
+${formatSituationResponses(retrievedContext.situations, retrievedContext.currentSituation)}
+
 Latest message handling:
 - Response mode: ${activeMessageNeed.responseMode}
 - Topic hint: ${activeMessageNeed.topicHint || "None"}
+- Situation type: ${retrievedContext.currentSituation || "general-chat"}
 ${formatMessageGuidance(activeMessageNeed.guidance)}
 
 Reply mode:
@@ -1077,6 +1468,9 @@ Response guidelines:
 - It is okay to use short multi-line messages if that matches the persona examples.
 - For work or planning topics, give a concrete next step instead of vague encouragement.
 - Match the situation, not just shared keywords from examples.
+- Let the dominant personality traits stay stable across turns, especially directness, empathy, confidence, and humor.
+- Use conversation habits only when they fit the moment; do not force greetings, closings, abbreviations, or emojis into every reply.
+- If a matching situation pattern is available, follow its guidance before falling back to generic stylistic imitation.
 - Casual topics like gym, travel, food, or greetings should sound natural and conversational unless the user is clearly avoiding work.
 - If the reply mode is short casual, answer in 1 to 2 short lines.
 - If the reply mode is short casual, answer the literal question first and do not add explanation unless needed.
@@ -1160,7 +1554,9 @@ export function getGroundingSummary(retrievedContext) {
   return {
     knowledge: retrievedContext.knowledge.map((item) => item.title),
     memories: retrievedContext.memories.map((item) => item.title),
+    situations: retrievedContext.situations.map((item) => item.id),
     examples: retrievedContext.examples.map((item) => item.id),
+    currentSituation: retrievedContext.currentSituation,
     messageIntents: retrievedContext.messageIntents,
     shortReplyMode: retrievedContext.shortReplyMode
   };
