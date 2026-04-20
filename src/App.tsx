@@ -4,6 +4,7 @@ import {
   fetchApi,
   type BootstrapResponse,
   type Conversation,
+  type KnowledgeDocument,
   type PersonaSummary,
   type StoredMessage
 } from "./api";
@@ -44,6 +45,10 @@ function getStoredConversationId() {
   return existing ?? null;
 }
 
+function uniqueItems(items: string[]) {
+  return [...new Set(items.filter(Boolean))];
+}
+
 export default function App() {
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
@@ -58,6 +63,9 @@ export default function App() {
   const [groundingItems, setGroundingItems] = useState<string[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(getStoredConversationId());
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
+  const [knowledgeFile, setKnowledgeFile] = useState<File | null>(null);
+  const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
   const [showConversationList, setShowConversationList] = useState(false);
   const [isBootstrapLoading, setIsBootstrapLoading] = useState(true);
   const [isPersonaReady, setIsPersonaReady] = useState(false);
@@ -71,6 +79,16 @@ export default function App() {
     }
 
     setConversations(data.conversations ?? []);
+  }
+
+  async function loadKnowledgeDocuments() {
+    const { response, data } = await fetchApi("/api/rag/documents");
+
+    if (!response.ok) {
+      throw new Error(data.error ?? "Failed to load knowledge documents");
+    }
+
+    setKnowledgeDocuments((data.documents ?? []) as KnowledgeDocument[]);
   }
 
   async function loadCurrentConversation(activeConversationId: string) {
@@ -130,7 +148,7 @@ export default function App() {
 
     const loadChatState = async () => {
       try {
-        await loadConversations();
+        await Promise.all([loadConversations(), loadKnowledgeDocuments()]);
 
         if (!isMounted || !conversationId) {
           return;
@@ -214,11 +232,14 @@ export default function App() {
       ]);
       setResponse(reply);
       setPersonaName((data.personaName as string) ?? "Persona Avatar");
-      setGroundingItems([
-        ...((data.grounding?.knowledge ?? []) as string[]),
-        ...((data.grounding?.memories ?? []) as string[]),
-        ...((data.grounding?.priorChats ?? []) as string[])
-      ]);
+      setGroundingItems(
+        uniqueItems([
+          ...((data.grounding?.knowledge ?? []) as string[]),
+          ...((data.grounding?.memories ?? []) as string[]),
+          ...((data.grounding?.documents ?? []) as string[]),
+          ...((data.grounding?.priorChats ?? []) as string[])
+        ])
+      );
 
       void refreshConversationsAfterChat();
     } catch (err) {
@@ -235,6 +256,64 @@ export default function App() {
       await loadConversations();
     } catch (err) {
       console.warn("Failed to refresh conversations:", err);
+    }
+  };
+
+  const uploadKnowledgeFile = async () => {
+    if (!knowledgeFile || isKnowledgeUploading) {
+      return;
+    }
+
+    setIsKnowledgeUploading(true);
+    setError("");
+
+    try {
+      const content = await knowledgeFile.text();
+
+      if (!content.trim()) {
+        throw new Error("That file is empty.");
+      }
+
+      const { response, data } = await fetchApi("/api/rag/documents", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          name: knowledgeFile.name,
+          content,
+          sourceType: "file-upload"
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(data.error ?? "Failed to upload knowledge file");
+      }
+
+      setKnowledgeFile(null);
+      await loadKnowledgeDocuments();
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Failed to upload knowledge file");
+    } finally {
+      setIsKnowledgeUploading(false);
+    }
+  };
+
+  const deleteKnowledgeDocument = async (documentId: string) => {
+    try {
+      const { response, data } = await fetchApi(`/api/rag/documents/${documentId}`, {
+        method: "DELETE"
+      });
+
+      if (!response.ok) {
+        throw new Error(data.error ?? "Failed to delete knowledge document");
+      }
+
+      setKnowledgeDocuments((current) => current.filter((document) => document.id !== documentId));
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : "Failed to delete knowledge document");
     }
   };
 
@@ -283,6 +362,8 @@ export default function App() {
       setGroundingItems([]);
       setInput("");
       setConversations([]);
+      setKnowledgeDocuments([]);
+      setKnowledgeFile(null);
       setShowConversationList(false);
       window.localStorage.removeItem(CURRENT_CONVERSATION_STORAGE_KEY);
       setConversationId(null);
@@ -343,7 +424,7 @@ export default function App() {
     <main className="app-shell">
       <section className="panel">
         <div className="hero-copy">
-          <p className="eyebrow">Persona-Grounded LiveAvatar</p>
+          <p className="eyebrow">Persona-Grounded LiveAvatar + RAG</p>
           <h1>{personaName}</h1>
           <p className="subtitle">{personaSummary}</p>
           <div className="conversation-controls">
@@ -370,6 +451,58 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        <section className="knowledge-card">
+          <div className="knowledge-header">
+            <div>
+              <span className="knowledge-label">Knowledge Files</span>
+              <p className="knowledge-copy">
+                Upload text, markdown, notes, specs, or code snippets. The avatar will retrieve
+                relevant chunks during chat.
+              </p>
+            </div>
+            <div className="knowledge-upload">
+              <input
+                type="file"
+                accept=".txt,.md,.markdown,.json,.js,.ts,.tsx,.jsx,.py,.java,.c,.cpp,.csv"
+                onChange={(event) => setKnowledgeFile(event.target.files?.[0] ?? null)}
+              />
+              <button
+                className="btn-text"
+                onClick={() => void uploadKnowledgeFile()}
+                disabled={!knowledgeFile || isKnowledgeUploading}
+              >
+                {isKnowledgeUploading ? "Uploading..." : "Add File"}
+              </button>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {knowledgeDocuments.length > 0 ? (
+              knowledgeDocuments.map((document) => (
+                <article key={document.id} className="knowledge-item">
+                  <div>
+                    <strong>{document.title}</strong>
+                    <p>
+                      {document.chunk_count} chunks • {document.char_count.toLocaleString()} chars
+                    </p>
+                    {document.metadata?.preview ? <p>{document.metadata.preview}</p> : null}
+                  </div>
+                  <button
+                    className="btn-text"
+                    onClick={() => void deleteKnowledgeDocument(document.id)}
+                    title="Remove this knowledge file"
+                  >
+                    Remove
+                  </button>
+                </article>
+              ))
+            ) : (
+              <p className="knowledge-empty">
+                No RAG files yet. Upload one to let the avatar answer from your own docs too.
+              </p>
+            )}
+          </div>
+        </section>
 
         {showConversationList && conversations.length > 0 ? (
           <div className="conversation-list">
@@ -466,8 +599,8 @@ export default function App() {
           <span>Grounding</span>
           <p>
             {groundingItems.length > 0
-              ? "This reply was grounded using the chosen persona style and any relevant prior-chat context."
-              : "Persona style clues and relevant prior-chat context will appear here after a response."}
+              ? "This reply was grounded using the persona style, any matching uploaded documents, and relevant prior-chat context."
+              : "Persona style clues, uploaded document matches, and relevant prior-chat context will appear here after a response."}
           </p>
           <div className="grounding-tags">
             {groundingItems.map((item) => (

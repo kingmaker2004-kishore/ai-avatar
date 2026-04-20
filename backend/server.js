@@ -19,11 +19,16 @@ import {
 } from "./personaEngine.js";
 import { initializeDatabase } from "./db/index.js";
 import {
-  buildPersonaProfileFromWhatsApp,
+  buildPersonaProfileFromWhatsAppWithGroq,
   enrichImportedPersonaProfile,
   getWhatsAppParticipants,
   parseWhatsAppChat
 } from "./whatsappPersona.js";
+import {
+  buildDocumentContextPrompt,
+  chunkKnowledgeDocument,
+  retrieveDocumentContext
+} from "./ragEngine.js";
 
 const backendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -44,10 +49,14 @@ app.use(express.json({ limit: "10mb" }));
 const port = Number(process.env.PORT ?? 5000);
 const liveAvatarApiKey = process.env.LIVEAVATAR_API_KEY ?? process.env.HEYGEN_API_KEY;
 const personaProfilePath = process.env.PERSONA_PROFILE_PATH;
-const personaHistoryTurns = Number(process.env.PERSONA_HISTORY_TURNS ?? 6);
-const personaMaxContextItems = Number(process.env.PERSONA_MAX_CONTEXT_ITEMS ?? 6);
-const personaSharedConversationCount = Number(process.env.PERSONA_SHARED_CONVERSATIONS ?? 3);
-const personaSharedConversationTurns = Number(process.env.PERSONA_SHARED_CONVERSATION_TURNS ?? 4);
+const personaHistoryTurns = Number(process.env.PERSONA_HISTORY_TURNS ?? 3); // Reduced from 6 to 3 to save tokens
+const personaMaxContextItems = Number(process.env.PERSONA_MAX_CONTEXT_ITEMS ?? 3); // Reduced from 6 to 3
+const personaSharedConversationCount = Number(process.env.PERSONA_SHARED_CONVERSATIONS ?? 1); // Reduced from 3 to 1
+const personaSharedConversationTurns = Number(process.env.PERSONA_SHARED_CONVERSATION_TURNS ?? 2); // Reduced from 4 to 2
+const personaRagMaxChunks = Number(process.env.PERSONA_RAG_MAX_CHUNKS ?? 2); // Reduced from 4 to 2
+const maxTokensPerRequest = sanitizeInteger(process.env.MAX_TOKENS_PER_REQUEST, 10000, 1000);
+const groqResponseTokenReserve = sanitizeInteger(process.env.GROQ_RESPONSE_TOKEN_RESERVE, 1200, 200);
+const maxPromptTokensPerRequest = Math.max(800, maxTokensPerRequest - groqResponseTokenReserve);
 const sessionSecret = process.env.SESSION_SECRET ?? "local-dev-persona-session-secret";
 const userSessionCookieName = "persona_user_session";
 
@@ -81,6 +90,11 @@ function loadEnvFile(envPath) {
       process.env[key] = value;
     }
   }
+}
+
+function sanitizeInteger(value, fallback, minimum = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= minimum ? Math.floor(parsed) : fallback;
 }
 
 function getLiveAvatarConfig() {
@@ -495,18 +509,26 @@ function formatPriorChats(memories) {
   });
 }
 
-function buildGroundingPayload(retrievedContext, sharedConversationMemories) {
+function buildGroundingPayload(retrievedContext, sharedConversationMemories, documentContext) {
   return {
     ...getGroundingSummary(retrievedContext),
+    documents: documentContext?.documentTitles ?? [],
     priorChats: formatPriorChats(sharedConversationMemories)
   };
 }
 
-function buildSystemPrompt(profile, retrievedContext, messageNeed, sharedConversationMemories) {
+function buildSystemPrompt(
+  profile,
+  retrievedContext,
+  messageNeed,
+  sharedConversationMemories,
+  documentContext
+) {
   const customSystemPrompt = process.env.GROQ_SYSTEM_PROMPT?.trim();
 
   return [
     buildPersonaPrompt(profile, retrievedContext, messageNeed),
+    buildDocumentContextPrompt(documentContext),
     buildConversationMemoryPrompt(sharedConversationMemories),
     customSystemPrompt ? `Additional runtime instructions:\n${customSystemPrompt}` : ""
   ]
@@ -537,15 +559,361 @@ function buildChatSuccessResponse({
   userId,
   profile,
   retrievedContext,
-  sharedConversationMemories
+  sharedConversationMemories,
+  documentContext
 }) {
   return {
     reply,
     conversationId,
     userId,
     personaName: profile.person.name,
-    grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories)
+    grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories, documentContext)
   };
+}
+
+// Conservative token estimation to stay under provider context limits.
+function estimateTokens(text) {
+  return Math.ceil((text?.length ?? 0) / 3);
+}
+
+function estimateMessageTokens(messages) {
+  return messages.reduce((total, msg) => {
+    return total + 4 + estimateTokens(msg.role) + estimateTokens(msg.content);
+  }, 2);
+}
+
+function limitItems(items, maxItems) {
+  return Array.isArray(items) ? items.slice(0, Math.max(0, maxItems)) : [];
+}
+
+function takeLastItems(items, maxItems) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  if (maxItems <= 0) {
+    return [];
+  }
+
+  return items.slice(-maxItems);
+}
+
+function truncateTextByTokens(value, maxTokens) {
+  return truncateText(value, Math.max(120, maxTokens) * 3);
+}
+
+function createPromptProfileVariant(profile, limits = {}) {
+  const habitItemLimit = limits.habitItemLimit ?? 3;
+
+  return {
+    ...profile,
+    person: {
+      ...profile.person,
+      summary: truncateText(profile.person.summary, limits.summaryChars ?? 220),
+      relationshipToUser: truncateText(profile.person.relationshipToUser, limits.relationshipChars ?? 160),
+      speakingStyle: limitItems(profile.person.speakingStyle, limits.speakingStyleLimit ?? 4).map((item) =>
+        truncateText(item, limits.speakingStyleChars ?? 100)
+      ),
+      signaturePhrases: limitItems(profile.person.signaturePhrases, limits.signaturePhraseLimit ?? 4).map((item) =>
+        truncateText(item, limits.signaturePhraseChars ?? 60)
+      ),
+      doNotDo: limitItems(profile.person.doNotDo, limits.doNotDoLimit ?? 4).map((item) =>
+        truncateText(item, limits.doNotDoChars ?? 120)
+      )
+    },
+    behaviorRules: limitItems(profile.behaviorRules, limits.behaviorRuleLimit ?? 6).map((item) =>
+      truncateText(item, limits.behaviorRuleChars ?? 140)
+    ),
+    styleSamples: limitItems(profile.styleSamples, limits.styleSampleLimit ?? 4).map((item) =>
+      truncateText(item, limits.styleSampleChars ?? 100)
+    ),
+    conversationHabits: {
+      ...profile.conversationHabits,
+      greetings: limitItems(profile.conversationHabits?.greetings, habitItemLimit),
+      closings: limitItems(profile.conversationHabits?.closings, habitItemLimit),
+      abbreviations: limitItems(profile.conversationHabits?.abbreviations, habitItemLimit),
+      acknowledgementPatterns: limitItems(
+        profile.conversationHabits?.acknowledgementPatterns,
+        habitItemLimit
+      ),
+      responseStyle: limitItems(profile.conversationHabits?.responseStyle, limits.responseStyleLimit ?? 4).map((item) =>
+        truncateText(item, limits.responseStyleChars ?? 90)
+      )
+    }
+  };
+}
+
+function createRetrievedContextVariant(retrievedContext, limits = {}) {
+  return {
+    ...retrievedContext,
+    knowledge: limitItems(retrievedContext?.knowledge, limits.knowledgeLimit ?? 2).map((item) => ({
+      ...item,
+      title: truncateText(item.title, 90),
+      content: truncateText(item.content, limits.knowledgeChars ?? 180),
+      tags: limitItems(item.tags, limits.tagLimit ?? 4),
+      personalSignificance: truncateText(item.personalSignificance, 90),
+      emotionalTone: truncateText(item.emotionalTone, 60)
+    })),
+    memories: limitItems(retrievedContext?.memories, limits.memoryLimit ?? 1).map((item) => ({
+      ...item,
+      title: truncateText(item.title, 80),
+      summary: truncateText(item.summary, limits.memorySummaryChars ?? 120),
+      transcriptSnippets: limitItems(item.transcriptSnippets, limits.memorySnippetLimit ?? 2).map((snippet) =>
+        truncateText(snippet, limits.memorySnippetChars ?? 80)
+      )
+    })),
+    situations: limitItems(retrievedContext?.situations, limits.situationLimit ?? 2).map((item) => ({
+      ...item,
+      title: truncateText(item.title, 80),
+      summary: truncateText(item.summary, limits.situationSummaryChars ?? 120),
+      guidance: truncateText(item.guidance, limits.situationGuidanceChars ?? 120)
+    })),
+    examples: limitItems(retrievedContext?.examples, limits.exampleLimit ?? 2).map((item) => ({
+      ...item,
+      previousAssistant: truncateText(item.previousAssistant, limits.exampleChars ?? 110),
+      user: truncateText(item.user, limits.exampleChars ?? 110),
+      assistant: truncateText(item.assistant, limits.exampleChars ?? 110),
+      notes: truncateText(item.notes, 100),
+      intents: limitItems(item.intents, limits.intentLimit ?? 4),
+      tags: limitItems(item.tags, limits.tagLimit ?? 4),
+      responseCharacteristics: limitItems(item.responseCharacteristics, 3),
+      personalityTraitsShown: limitItems(item.personalityTraitsShown, 3)
+    })),
+    messageIntents: limitItems(retrievedContext?.messageIntents, limits.messageIntentLimit ?? 4)
+  };
+}
+
+function createConversationMemoryVariant(memories, limits = {}) {
+  return takeLastItems(memories, limits.conversationLimit ?? 1).map((conversation) => ({
+    ...conversation,
+    messages: takeLastItems(conversation.messages, limits.turnLimit ?? 2).map((message) => ({
+      ...message,
+      content: truncateText(message.content, limits.messageChars ?? 120)
+    }))
+  }));
+}
+
+function createDocumentContextVariant(documentContext, limits = {}) {
+  const chunks = limitItems(documentContext?.chunks, limits.chunkLimit ?? 1).map((chunk) => ({
+    ...chunk,
+    content: truncateText(chunk.content, limits.chunkChars ?? 320),
+    preview: truncateText(chunk.preview, 140)
+  }));
+
+  return {
+    ...documentContext,
+    chunks,
+    documentTitles: [...new Set(chunks.map((chunk) => chunk.title).filter(Boolean))]
+  };
+}
+
+function createRecentMessagesVariant(messages, limits = {}) {
+  return takeLastItems(messages, limits.messageLimit ?? 4).map((message) => ({
+    ...message,
+    content: truncateText(message.content, limits.messageChars ?? 180)
+  }));
+}
+
+function buildMinimalGroqSystemPrompt(profile, messageNeed) {
+  const styleCues = limitItems(profile.person.speakingStyle, 3).join("; ") || "Natural concise chat style.";
+  const signaturePhrases = limitItems(profile.person.signaturePhrases, 4).join(", ") || "None";
+
+  return `
+You are speaking as ${profile.person.name}.
+Identity: ${truncateText(profile.person.summary, 180)}
+Relationship to the user: ${truncateText(profile.person.relationshipToUser, 120)}
+Style cues: ${styleCues}
+Signature phrases to use naturally when they fit: ${signaturePhrases}
+
+Rules:
+- Answer the user's literal question first.
+- Stay in character and keep claims grounded.
+- Match the user's language mix when it fits the persona.
+- Be concise unless the user explicitly asks for detail.
+- If unsure, say so naturally instead of inventing facts or memories.
+
+Latest message handling:
+- Response mode: ${messageNeed?.responseMode || "persona-chat"}
+- Topic hint: ${messageNeed?.topicHint || "None"}
+`.trim();
+}
+
+function buildGroqRequestContext({
+  profile,
+  retrievedContext,
+  messageNeed,
+  sharedConversationMemories,
+  documentContext,
+  recentMessages,
+  userMessage,
+  maxPromptTokens,
+  forceMinimal = false
+}) {
+  const compactProfile = createPromptProfileVariant(profile, {
+    behaviorRuleLimit: 5,
+    styleSampleLimit: 3,
+    speakingStyleLimit: 4,
+    signaturePhraseLimit: 4,
+    doNotDoLimit: 3,
+    responseStyleLimit: 3,
+    habitItemLimit: 2
+  });
+  const minimalRetrievedContext = createRetrievedContextVariant(retrievedContext, {
+    knowledgeLimit: 0,
+    memoryLimit: 0,
+    situationLimit: 1,
+    exampleLimit: 0,
+    messageIntentLimit: 3
+  });
+
+  const buildVariant = ({
+    mode,
+    promptProfile = profile,
+    promptRetrievedContext = retrievedContext,
+    promptMemories = sharedConversationMemories,
+    promptDocumentContext = documentContext,
+    promptRecentMessages = recentMessages,
+    systemPromptOverride = ""
+  }) => {
+    const systemPrompt =
+      systemPromptOverride ||
+      buildSystemPrompt(
+        promptProfile,
+        promptRetrievedContext,
+        messageNeed,
+        promptMemories,
+        promptDocumentContext
+      );
+
+    return {
+      mode,
+      retrievedContext: promptRetrievedContext,
+      sharedConversationMemories: promptMemories,
+      documentContext: promptDocumentContext,
+      messages: buildGroqMessages(systemPrompt, promptRecentMessages, userMessage)
+    };
+  };
+
+  const variants = forceMinimal
+    ? [
+        buildVariant({
+          mode: "minimal",
+          promptProfile: compactProfile,
+          promptRetrievedContext: minimalRetrievedContext,
+          promptMemories: [],
+          promptDocumentContext: { ...documentContext, chunks: [], documentTitles: [] },
+          promptRecentMessages: createRecentMessagesVariant(recentMessages, { messageLimit: 1, messageChars: 120 }),
+          systemPromptOverride: buildMinimalGroqSystemPrompt(compactProfile, messageNeed)
+        })
+      ]
+    : [
+        buildVariant({ mode: "full" }),
+        buildVariant({
+          mode: "reduced",
+          promptProfile: createPromptProfileVariant(profile, {
+            behaviorRuleLimit: 8,
+            styleSampleLimit: 6,
+            speakingStyleLimit: 6,
+            signaturePhraseLimit: 6,
+            doNotDoLimit: 4,
+            responseStyleLimit: 4,
+            habitItemLimit: 3
+          }),
+          promptRetrievedContext: createRetrievedContextVariant(retrievedContext, {
+            knowledgeLimit: 2,
+            memoryLimit: 1,
+            situationLimit: 2,
+            exampleLimit: 2
+          }),
+          promptMemories: createConversationMemoryVariant(sharedConversationMemories, {
+            conversationLimit: 1,
+            turnLimit: 2,
+            messageChars: 120
+          }),
+          promptDocumentContext: createDocumentContextVariant(documentContext, {
+            chunkLimit: 1,
+            chunkChars: 380
+          }),
+          promptRecentMessages: createRecentMessagesVariant(recentMessages, {
+            messageLimit: 4,
+            messageChars: 180
+          })
+        }),
+        buildVariant({
+          mode: "compact",
+          promptProfile: compactProfile,
+          promptRetrievedContext: createRetrievedContextVariant(retrievedContext, {
+            knowledgeLimit: 1,
+            memoryLimit: 0,
+            situationLimit: 1,
+            exampleLimit: 1,
+            messageIntentLimit: 3
+          }),
+          promptMemories: [],
+          promptDocumentContext: createDocumentContextVariant(documentContext, {
+            chunkLimit: 1,
+            chunkChars: 220
+          }),
+          promptRecentMessages: createRecentMessagesVariant(recentMessages, {
+            messageLimit: 2,
+            messageChars: 140
+          })
+        }),
+        buildVariant({
+          mode: "minimal",
+          promptProfile: compactProfile,
+          promptRetrievedContext: minimalRetrievedContext,
+          promptMemories: [],
+          promptDocumentContext: { ...documentContext, chunks: [], documentTitles: [] },
+          promptRecentMessages: createRecentMessagesVariant(recentMessages, {
+            messageLimit: 1,
+            messageChars: 120
+          }),
+          systemPromptOverride: buildMinimalGroqSystemPrompt(compactProfile, messageNeed)
+        })
+      ];
+
+  let selectedVariant = variants[variants.length - 1];
+
+  for (const variant of variants) {
+    const estimatedTokens = estimateMessageTokens(variant.messages);
+    selectedVariant = { ...variant, estimatedTokens };
+
+    if (estimatedTokens <= maxPromptTokens) {
+      return selectedVariant;
+    }
+  }
+
+  const nonSystemMessages = selectedVariant.messages.slice(1);
+  const nonSystemTokens = estimateMessageTokens(nonSystemMessages);
+  const remainingSystemTokens = Math.max(160, maxPromptTokens - nonSystemTokens - 12);
+  const hardTrimmedMessages = [
+    {
+      ...selectedVariant.messages[0],
+      content: truncateTextByTokens(selectedVariant.messages[0].content, remainingSystemTokens)
+    },
+    ...nonSystemMessages
+  ];
+
+  return {
+    ...selectedVariant,
+    mode: `${selectedVariant.mode}-hard-trim`,
+    messages: hardTrimmedMessages,
+    estimatedTokens: estimateMessageTokens(hardTrimmedMessages)
+  };
+}
+
+function errorDetailsContainTokenLimit(details) {
+  const normalized =
+    typeof details === "string" ? details.toLowerCase() : JSON.stringify(details).toLowerCase();
+
+  return (
+    normalized.includes("token") ||
+    normalized.includes("context length") ||
+    normalized.includes("context window") ||
+    normalized.includes("prompt is too long") ||
+    normalized.includes("maximum context")
+  );
 }
 
 async function parseError(response) {
@@ -568,6 +936,7 @@ app.get("/", (_req, res) => {
     api: {
       persona: "/api/persona",
       bootstrap: "/api/persona/bootstrap",
+      ragDocuments: "/api/rag/documents",
       conversations: "/api/conversations",
       chat: "/api/chat",
       liveAvatarSessionToken: "/api/heygen/session-token"
@@ -617,7 +986,7 @@ app.post("/api/persona/preview-whatsapp", (req, res) => {
   });
 });
 
-app.post("/api/persona/configure-whatsapp", (req, res) => {
+app.post("/api/persona/configure-whatsapp", async (req, res) => {
   const userId = getUserId(req, res);
   const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
   const selectedPerson = typeof req.body?.selectedPerson === "string" ? req.body.selectedPerson.trim() : "";
@@ -634,7 +1003,10 @@ app.post("/api/persona/configure-whatsapp", (req, res) => {
   }
 
   try {
-    const rawProfile = buildPersonaProfileFromWhatsApp(messages, selectedPerson);
+    const rawProfile = await buildPersonaProfileFromWhatsAppWithGroq(messages, selectedPerson, {
+      apiKey: process.env.GROQ_API_KEY,
+      model: process.env.GROQ_PERSONA_MODEL ?? process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile"
+    });
     const personaState = saveUserPersona(userId, selectedPerson, rawProfile);
 
     return res.json({
@@ -656,6 +1028,85 @@ app.delete("/api/persona", (req, res) => {
     ok: true,
     persona: buildPersonaResponse(getUserPersonaState(userId))
   });
+});
+
+app.get("/api/rag/documents", (req, res) => {
+  const userId = getUserId(req, res);
+
+  try {
+    const documents = db.listKnowledgeDocuments(userId);
+
+    return res.json({
+      userId,
+      documents
+    });
+  } catch (error) {
+    console.error("Error fetching RAG documents:", error);
+    return res.status(500).json({ error: "Failed to fetch knowledge documents." });
+  }
+});
+
+app.post("/api/rag/documents", (req, res) => {
+  const userId = getUserId(req, res);
+  const title = compactWhitespace(req.body?.name);
+  const content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
+  const sourceType = compactWhitespace(req.body?.sourceType) || "text-upload";
+
+  if (!title) {
+    return res.status(400).json({ error: "Document name is required." });
+  }
+
+  if (!content) {
+    return res.status(400).json({ error: "Document content is required." });
+  }
+
+  if (content.length > 250_000) {
+    return res.status(400).json({ error: "Document is too large. Keep uploads under 250,000 characters." });
+  }
+
+  try {
+    const chunks = chunkKnowledgeDocument(content);
+
+    if (chunks.length === 0) {
+      return res.status(400).json({ error: "Could not extract readable text from that document." });
+    }
+
+    const document = db.saveKnowledgeDocument(userId, {
+      title,
+      sourceType,
+      charCount: content.length,
+      metadata: {
+        preview: truncateText(content, 260)
+      },
+      chunks
+    });
+
+    return res.json({
+      userId,
+      document
+    });
+  } catch (error) {
+    console.error("Error saving RAG document:", error);
+    return res.status(500).json({ error: "Failed to save knowledge document." });
+  }
+});
+
+app.delete("/api/rag/documents/:id", (req, res) => {
+  const userId = getUserId(req, res);
+  const { id } = req.params;
+
+  try {
+    const success = db.deleteKnowledgeDocument(id, userId);
+
+    if (!success) {
+      return res.status(404).json({ error: "Knowledge document not found." });
+    }
+
+    return res.json({ success: true, documentId: id });
+  } catch (error) {
+    console.error("Error deleting RAG document:", error);
+    return res.status(500).json({ error: "Failed to delete knowledge document." });
+  }
 });
 
 // Conversation management endpoints
@@ -846,12 +1297,23 @@ app.post("/api/chat", async (req, res) => {
     const retrievedContext = retrievePersonaContext(
       profile,
       userMessage,
-      personaMaxContextItems
+      personaMaxContextItems,
+      recentMessages
+    );
+    const documentContext = retrieveDocumentContext(
+      userMessage,
+      recentMessages,
+      db.getKnowledgeChunks(userId),
+      personaRagMaxChunks
     );
     const messageNeed = analyzePersonaReplyNeed(userMessage, recentMessages);
     const deterministicReply = buildDeterministicPersonaReply(userMessage, recentMessages);
-    const heuristicReply = profile.defaults.enableHeuristicReplies
-      ? buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext)
+    const canUseHeuristicReply =
+      profile.defaults.enableHeuristicReplies &&
+      documentContext.chunks.length === 0 &&
+      messageNeed.responseMode === "persona-chat";
+    const heuristicReply = canUseHeuristicReply
+      ? buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext, profile)
       : "";
 
     if (deterministicReply || heuristicReply) {
@@ -865,67 +1327,154 @@ app.post("/api/chat", async (req, res) => {
           userId,
           profile,
           retrievedContext,
-          sharedConversationMemories
+          sharedConversationMemories,
+          documentContext
         })
       );
     }
 
-    const systemPrompt = buildSystemPrompt(
+    const groqRequestContext = buildGroqRequestContext({
       profile,
       retrievedContext,
       messageNeed,
-      sharedConversationMemories
-    );
-    const messages = buildGroqMessages(systemPrompt, recentMessages, userMessage);
-
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
-        messages,
-        temperature: profile.defaults.temperature ?? 0.7,
-        stream: false
-      })
+      sharedConversationMemories,
+      documentContext,
+      recentMessages,
+      userMessage,
+      maxPromptTokens: maxPromptTokensPerRequest
     });
+    const {
+      messages,
+      retrievedContext: effectiveRetrievedContext,
+      sharedConversationMemories: effectiveSharedConversationMemories,
+      documentContext: effectiveDocumentContext,
+      estimatedTokens,
+      mode: groqPromptMode
+    } = groqRequestContext;
 
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: "Groq request failed.",
-        details: await parseError(response)
+    // Validate messages before sending
+    if (!Array.isArray(messages) || messages.length === 0) {
+      console.error("Invalid messages format:", messages);
+      return res.status(400).json({
+        error: "Invalid messages format."
       });
     }
 
-    const data = await response.json();
-    const rawReply = data?.choices?.[0]?.message?.content?.trim();
-    const reply = postProcessPersonaReply(rawReply, retrievedContext);
+    console.log(
+      `Estimated prompt tokens: ${estimatedTokens} / ${maxPromptTokensPerRequest} (${groqPromptMode})`
+    );
 
-    if (!reply) {
+    if (estimatedTokens > maxPromptTokensPerRequest) {
+      console.warn(
+        `Prompt still large after trimming (${estimatedTokens} > ${maxPromptTokensPerRequest}). Sending minimal fallback.`
+      );
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+
+    let response;
+    try {
+      response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
+          messages,
+          temperature: profile.defaults.temperature ?? 0.7,
+          stream: false
+        }),
+        signal: controller.signal
+      });
+    } catch (fetchError) {
+      clearTimeout(timeout);
+      if (fetchError.name === "AbortError") {
+        console.error("Groq request timeout after 30 seconds");
+        return res.status(504).json({
+          error: "Groq request timeout. Please try again."
+        });
+      }
+      console.error("Groq fetch error:", fetchError.message);
+      return res.status(503).json({
+        error: "Unable to reach Groq. Check your internet connection.",
+        details: fetchError.message
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      const errorData = await parseError(response);
+      console.error(`Groq API error (${response.status}):`, errorData);
+      
+      let errorMessage = "Groq request failed.";
+      if (response.status === 401) {
+        errorMessage = "Invalid Groq API key.";
+      } else if (response.status === 429) {
+        errorMessage = "Rate limit exceeded. Please try again later.";
+      } else if (response.status === 404) {
+        errorMessage = "Groq model not found. Check GROQ_MODEL setting.";
+      } else if ((response.status === 400 || response.status === 413) && errorDetailsContainTokenLimit(errorData)) {
+        errorMessage = "Groq request exceeded the model token limit. The backend trimmed the prompt, but the persona or context is still too large.";
+      }
+      
+      return res.status(response.status).json({
+        error: errorMessage,
+        details: errorData
+      });
+    }
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (parseError) {
+      console.error("Failed to parse Groq response:", parseError);
+      return res.status(502).json({
+        error: "Invalid response from Groq."
+      });
+    }
+
+    const rawReply = data?.choices?.[0]?.message?.content?.trim();
+    
+    if (!rawReply) {
+      console.error("Empty reply from Groq:", data);
       return res.status(502).json({
         error: "Groq returned an empty response."
+      });
+    }
+
+    const reply = postProcessPersonaReply(rawReply, effectiveRetrievedContext);
+
+    if (!reply) {
+      console.error("Post-processing resulted in empty reply:", rawReply);
+      return res.status(502).json({
+        error: "Failed to process Groq response."
       });
     }
 
     saveConversationReply(db, userId, convId, userMessage, reply);
 
     return res.json(
-      buildChatSuccessResponse({
-        reply,
-        conversationId: convId,
-        userId,
-        profile,
-        retrievedContext,
-        sharedConversationMemories
-      })
-    );
+        buildChatSuccessResponse({
+          reply,
+          conversationId: convId,
+          userId,
+          profile,
+          retrievedContext: effectiveRetrievedContext,
+          sharedConversationMemories: effectiveSharedConversationMemories,
+          documentContext: effectiveDocumentContext
+        })
+      );
   } catch (error) {
-    console.error("Groq chat error:", error);
+    console.error("Groq chat error:", error.message || error);
+    console.error("Error stack:", error.stack);
 
     return res.status(500).json({
-      error: "Unable to reach Groq."
+      error: "Unable to reach Groq.",
+      details: error.message
     });
   }
 });

@@ -37,6 +37,20 @@ export type Participant = {
   preview: string;
 };
 
+export type KnowledgeDocument = {
+  id: string;
+  user_id: string;
+  title: string;
+  source_type: string;
+  char_count: number;
+  chunk_count: number;
+  created_at: string;
+  updated_at: string;
+  metadata?: {
+    preview?: string;
+  };
+};
+
 function resolveApiBaseUrl() {
   const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 

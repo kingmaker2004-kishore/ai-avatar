@@ -27,9 +27,23 @@ function parsePreferences(value) {
   }
 }
 
+function parseJsonObject(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 class ChatDatabase {
   constructor() {
     this.db = new Database(dbPath);
+    this.db.pragma("foreign_keys = ON");
     this.db.pragma("journal_mode = WAL");
     this.initializeSchema();
   }
@@ -300,6 +314,138 @@ class ChatDatabase {
     );
 
     return stmt.all(conversationId, userId);
+  }
+
+  /**
+   * Persist a knowledge document and its retrieval chunks
+   */
+  saveKnowledgeDocument(
+    userId,
+    {
+      title,
+      sourceType = "text-upload",
+      charCount = 0,
+      metadata = {},
+      chunks = []
+    }
+  ) {
+    this.getUserProfile(userId);
+
+    const documentId = crypto.randomUUID();
+    const insertDocumentStmt = this.db.prepare(
+      `INSERT INTO knowledge_documents (id, user_id, title, source_type, char_count, metadata)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    const insertChunkStmt = this.db.prepare(
+      `INSERT INTO knowledge_chunks (id, document_id, user_id, chunk_index, content, preview, token_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const saveTransaction = this.db.transaction((payload) => {
+      insertDocumentStmt.run(
+        documentId,
+        userId,
+        payload.title,
+        payload.sourceType,
+        payload.charCount,
+        JSON.stringify(payload.metadata ?? {})
+      );
+
+      payload.chunks.forEach((chunk, index) => {
+        insertChunkStmt.run(
+          crypto.randomUUID(),
+          documentId,
+          userId,
+          index,
+          chunk.content,
+          chunk.preview ?? "",
+          chunk.tokenCount ?? 0
+        );
+      });
+    });
+
+    saveTransaction({
+      title,
+      sourceType,
+      charCount,
+      metadata,
+      chunks
+    });
+
+    return this.getKnowledgeDocument(documentId, userId);
+  }
+
+  /**
+   * List user-uploaded knowledge documents
+   */
+  listKnowledgeDocuments(userId) {
+    const stmt = this.db.prepare(
+      `SELECT d.*,
+        (SELECT COUNT(*) FROM knowledge_chunks WHERE document_id = d.id) AS chunk_count
+       FROM knowledge_documents d
+       WHERE d.user_id = ?
+       ORDER BY d.updated_at DESC`
+    );
+
+    return stmt.all(userId).map((document) => ({
+      ...document,
+      chunk_count: Number(document.chunk_count ?? 0),
+      metadata: parseJsonObject(document.metadata)
+    }));
+  }
+
+  /**
+   * Fetch one user knowledge document
+   */
+  getKnowledgeDocument(documentId, userId) {
+    const stmt = this.db.prepare(
+      `SELECT d.*,
+        (SELECT COUNT(*) FROM knowledge_chunks WHERE document_id = d.id) AS chunk_count
+       FROM knowledge_documents d
+       WHERE d.id = ? AND d.user_id = ?`
+    );
+    const document = stmt.get(documentId, userId);
+
+    if (!document) {
+      return null;
+    }
+
+    return {
+      ...document,
+      chunk_count: Number(document.chunk_count ?? 0),
+      metadata: parseJsonObject(document.metadata)
+    };
+  }
+
+  /**
+   * Fetch all retrieval chunks for a user
+   */
+  getKnowledgeChunks(userId) {
+    const stmt = this.db.prepare(
+      `SELECT kc.id, kc.document_id, kc.chunk_index, kc.content, kc.preview, kc.token_count,
+              kd.title, kd.source_type, kd.updated_at
+       FROM knowledge_chunks kc
+       JOIN knowledge_documents kd ON kd.id = kc.document_id
+       WHERE kc.user_id = ?
+       ORDER BY kd.updated_at DESC, kc.chunk_index ASC`
+    );
+
+    return stmt.all(userId).map((chunk) => ({
+      ...chunk,
+      token_count: Number(chunk.token_count ?? 0)
+    }));
+  }
+
+  /**
+   * Delete a knowledge document and all of its chunks
+   */
+  deleteKnowledgeDocument(documentId, userId) {
+    const stmt = this.db.prepare(
+      "DELETE FROM knowledge_documents WHERE id = ? AND user_id = ?"
+    );
+    const result = stmt.run(documentId, userId);
+
+    return result.changes > 0;
   }
 
   /**

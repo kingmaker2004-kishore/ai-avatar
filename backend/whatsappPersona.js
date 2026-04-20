@@ -447,24 +447,15 @@ function inferConversationHabits(messages) {
 function classifySituationType(userText, assistantText = "") {
   const normalizedUser = compactWhitespace(userText).toLowerCase();
   const normalizedAssistant = compactWhitespace(assistantText).toLowerCase();
+  const userAct = detectMessageAct(userText);
+  const assistantAct = detectMessageAct(assistantText);
 
-  if (
-    includesAnyKeyword(normalizedUser, [
-      "sorry",
-      "failed",
-      "not working",
-      "late",
-      "can't",
-      "cannot",
-      "unable",
-      "missed",
-      "mistake"
-    ])
-  ) {
+  if (["apology", "complaint"].includes(userAct)) {
     return "bad-news";
   }
 
   if (
+    userAct === "update" &&
     includesAnyKeyword(normalizedUser, [
       "done",
       "completed",
@@ -485,57 +476,32 @@ function classifySituationType(userText, assistantText = "") {
     return "problem-solving";
   }
 
+  if (userAct === "correction" || assistantAct === "correction") {
+    return "correction";
+  }
+
   if (
     includesAnyKeyword(normalizedUser, [
       "free",
       "available",
       "time",
+      "timing",
       "today",
       "tomorrow",
       "morning",
       "evening",
-      "call",
-      "connect",
-      "meet"
+      "schedule",
+      "plan"
     ])
   ) {
     return "scheduling";
   }
 
-  if (
-    includesAnyKeyword(normalizedUser, [
-      "please",
-      "send",
-      "share",
-      "check",
-      "call",
-      "come",
-      "help me",
-      "can you",
-      "could you"
-    ])
-  ) {
+  if (userAct === "request" || userAct === "proposal") {
     return "request";
   }
 
-  if (
-    includesAnyKeyword(normalizedAssistant, [
-      "i said",
-      "wrong",
-      "not like that",
-      "should",
-      "sonna",
-      "never",
-      "professional space"
-    ])
-  ) {
-    return "correction";
-  }
-
-  if (
-    normalizedUser.includes("?") ||
-    /^(what|why|when|where|who|how)\b/i.test(normalizedUser)
-  ) {
+  if (userAct === "question" || userAct === "detail-request") {
     return "question";
   }
 
@@ -704,6 +670,135 @@ function includesAnyKeyword(value, keywords) {
   return keywords.some((keyword) => value.includes(keyword));
 }
 
+function detectMessageAct(value) {
+  const normalized = compactWhitespace(value).toLowerCase();
+  const wordCount = countWords(normalized);
+
+  if (!normalized) {
+    return "statement";
+  }
+
+  if (/^(hi|hey|hello|gm|gn|good morning|good night|morning|night)\b/i.test(normalized)) {
+    return "greeting";
+  }
+
+  if (/^(no|nope|illa|illai|vendam|later|leave it)\b/i.test(normalized)) {
+    return "rejection";
+  }
+
+  if (/\b(sorry|my bad|apolog)\b/i.test(normalized)) {
+    return "apology";
+  }
+
+  if (
+    includesAnyKeyword(normalized, [
+      "not received",
+      "didn't",
+      "didnt",
+      "can't",
+      "cannot",
+      "unable",
+      "missed",
+      "late",
+      "wrong",
+      "seri illa",
+      "not like that",
+      "varala",
+      "kekala"
+    ])
+  ) {
+    return "complaint";
+  }
+
+  if (
+    includesAnyKeyword(normalized, [
+      "illa",
+      "wrong",
+      "not like that",
+      "should be",
+      "should've",
+      "poi illa",
+      "instead"
+    ])
+  ) {
+    return "correction";
+  }
+
+  if (
+    /\b(?:free|available)\s+ah\b/i.test(normalized) ||
+    /\b(?:poriya|variya|varriya|irukiya|irukkiya|poviya|varuva|varuviya|venuma|mudiyuma|theriyuma|sollava|collage poriya)\b/i.test(
+      normalized
+    ) ||
+    /\b[a-z0-9]+\s+ah\b/i.test(normalized)
+  ) {
+    return "question";
+  }
+
+  if (
+    normalized.includes("?") ||
+    /^(what|why|when|where|who|how|which|evalo|epo|eppo|enga)\b/i.test(normalized)
+  ) {
+    return "question";
+  }
+
+  if (
+    /^(ok|okay|kk|k|hmm|hm|mm|seri|sari|ryt|right|sure|fine|cool|done|ok da|okay da)\b/i.test(
+      normalized
+    ) &&
+    !normalized.includes("?") &&
+    wordCount <= 4
+  ) {
+    return "confirmation";
+  }
+
+  if (
+    /\b(let'?s|lets|shall we|can we|we can)\b/i.test(normalized) ||
+    /\b(polam|polaam|polama|variya)\b/i.test(normalized)
+  ) {
+    return "proposal";
+  }
+
+  if (
+    /\b(can you|could you|please|need you|help me)\b/i.test(normalized) ||
+    /^(send|share|check|come|give|tell|make|bring|put|confirm|book|transfer)\b/i.test(
+      normalized
+    )
+  ) {
+    return "request";
+  }
+
+  if (
+    includesAnyKeyword(normalized, [
+      "done",
+      "completed",
+      "finished",
+      "sent",
+      "started",
+      "reached",
+      "left",
+      "booked",
+      "coming",
+      "on the way"
+    ])
+  ) {
+    return "update";
+  }
+
+  if (
+    wordCount <= 3 &&
+    (/\b\d{1,2}(?::|\.)?\d{0,2}\s*(?:am|pm)?\b/i.test(normalized) ||
+      /^(time|timing|amount|price|place|location|address|details?)\b/i.test(normalized))
+  ) {
+    return "detail-request";
+  }
+
+  if (wordCount <= 4) {
+    return "detail";
+  }
+
+  return "statement";
+}
+
 function inferMessageIntents(value) {
   const normalized = compactWhitespace(value).toLowerCase();
 
@@ -814,11 +909,38 @@ function combinePriorContextRun(messages, startIndex, personName) {
   return {
     user,
     authors,
-    nextIndex: index + 1
+    nextIndex: index + 1,
+    previousAssistantIndex: index
   };
 }
 
-function buildExampleNotes(userText, assistantText, tags, intents, authors) {
+function combinePreviousAssistantRun(messages, endIndex, personName) {
+  if (endIndex < 0 || messages[endIndex]?.author !== personName) {
+    return "";
+  }
+
+  const collected = [];
+  let index = endIndex;
+
+  while (index >= 0 && messages[index].author === personName) {
+    collected.push(compactWhitespace(messages[index].content));
+    index -= 1;
+  }
+
+  collected.reverse();
+  return collected.join("\n");
+}
+
+function buildExampleNotes(
+  userText,
+  assistantText,
+  tags,
+  intents,
+  authors,
+  userAct,
+  assistantAct,
+  previousAssistantText = ""
+) {
   const notes = [];
   const styleNotes = buildStyleNotes(assistantText);
 
@@ -832,6 +954,16 @@ function buildExampleNotes(userText, assistantText, tags, intents, authors) {
 
   if (intents.length > 0) {
     notes.push(`Intents: ${intents.join(", ")}.`);
+  }
+
+  if (userAct || assistantAct) {
+    notes.push(
+      `Act flow: ${userAct || "statement"} -> ${assistantAct || "statement"}.`
+    );
+  }
+
+  if (previousAssistantText) {
+    notes.push("This reply continues after the person's previous message.");
   }
 
   if (authors.length > 1) {
@@ -1059,6 +1191,12 @@ function enrichChatExamples(chatExamples) {
   return chatExamples.map((example, index) => {
     const userText = compactWhitespace(example.user);
     const assistantText = compactWhitespace(example.assistant);
+    const previousAssistantText = compactWhitespace(example.previous_assistant);
+    const previousAssistantAct =
+      toText(example.previous_assistant_act) || detectMessageAct(previousAssistantText);
+    const userMessageAct = toText(example.user_message_act) || detectMessageAct(userText);
+    const assistantMessageAct =
+      toText(example.assistant_message_act) || detectMessageAct(assistantText);
     const existingIntents = toArray(example.intents).map((intent) => compactWhitespace(intent)).filter(Boolean);
     const intents = unique([
       ...inferMessageIntents(userText),
@@ -1074,7 +1212,16 @@ function enrichChatExamples(chatExamples) {
       ...toArray(example.tags).map((tag) => compactWhitespace(tag).toLowerCase()).filter(Boolean)
     ]);
     const preservedNotes = toText(example.notes);
-    const generatedNotes = buildExampleNotes(userText, assistantText, topicTags, intents, []);
+    const generatedNotes = buildExampleNotes(
+      userText,
+      assistantText,
+      topicTags,
+      intents,
+      [],
+      userMessageAct,
+      assistantMessageAct,
+      previousAssistantText
+    );
     const responseCharacteristics = inferResponseCharacteristics(userText, assistantText);
     const personalityTraitsShown = inferTraitsShownByExample(assistantText, responseCharacteristics);
     const situationType =
@@ -1087,6 +1234,10 @@ function enrichChatExamples(chatExamples) {
       notes: mergeNotes(preservedNotes, generatedNotes),
       tags,
       intents,
+      previous_assistant: previousAssistantText,
+      previous_assistant_act: previousAssistantAct,
+      user_message_act: userMessageAct,
+      assistant_message_act: assistantMessageAct,
       situation_type: situationType,
       response_characteristics: responseCharacteristics,
       personality_traits_shown: personalityTraitsShown,
@@ -1108,6 +1259,10 @@ export function enrichImportedPersonaProfile(rawProfile) {
     notes: toText(item?.notes),
     tags: unique(toArray(item?.tags).map((tag) => toText(tag)).filter(Boolean)),
     intents: unique(toArray(item?.intents).map((intent) => toText(intent)).filter(Boolean)),
+    previous_assistant: toText(item?.previous_assistant),
+    previous_assistant_act: toText(item?.previous_assistant_act),
+    user_message_act: toText(item?.user_message_act),
+    assistant_message_act: toText(item?.assistant_message_act),
     situation_type: toText(item?.situation_type),
     response_characteristics: unique(
       toArray(item?.response_characteristics).map((entry) => toText(entry)).filter(Boolean)
@@ -1203,7 +1358,15 @@ export function enrichImportedPersonaProfile(rawProfile) {
     conversation_habits: conversationHabits,
     knowledge_base: knowledgeBase,
     situation_responses: situationResponses,
-    chat_examples: chatExamples
+    chat_examples: chatExamples,
+    defaults: {
+      ...rawProfile.defaults,
+      temperature:
+        typeof rawProfile?.defaults?.temperature === "number"
+          ? rawProfile.defaults.temperature
+          : 0.7,
+      enable_heuristic_replies: true
+    }
   };
 }
 
@@ -1329,9 +1492,17 @@ function buildChatExamples(allMessages, personName) {
 
     const assistantRun = combineAssistantRun(allMessages, index, personName);
     const priorContext = combinePriorContextRun(allMessages, index, personName);
+    const previousAssistantText = combinePreviousAssistantRun(
+      allMessages,
+      priorContext.previousAssistantIndex,
+      personName
+    );
     const userText = compactWhitespace(priorContext.user);
     const assistantText = compactWhitespace(assistantRun.assistant);
+    const previousAssistantAct = detectMessageAct(previousAssistantText);
     const intents = inferMessageIntents(userText);
+    const userMessageAct = detectMessageAct(userText);
+    const assistantMessageAct = detectMessageAct(assistantText);
     const topicTags = unique([...inferTopicTags(userText), ...inferTopicTags(assistantText)]);
     const tags = unique([
       "contextual-reply",
@@ -1354,10 +1525,17 @@ function buildChatExamples(allMessages, personName) {
         assistantText,
         topicTags,
         intents,
-        priorContext.authors
+        priorContext.authors,
+        userMessageAct,
+        assistantMessageAct,
+        previousAssistantText
       ),
       tags,
-      intents
+      intents,
+      previous_assistant: previousAssistantText,
+      previous_assistant_act: previousAssistantAct,
+      user_message_act: userMessageAct,
+      assistant_message_act: assistantMessageAct
     });
 
     index = assistantRun.nextIndex - 1;
@@ -1373,13 +1551,26 @@ function buildChatExamples(allMessages, personName) {
       id: `imported-example-${index + 1}`,
       user: "",
       assistant: compactWhitespace(message.content),
-      notes: buildExampleNotes("", message.content, inferTopicTags(message.content), ["general"], []),
+      notes: buildExampleNotes(
+        "",
+        message.content,
+        inferTopicTags(message.content),
+        ["general"],
+        [],
+        "",
+        detectMessageAct(message.content),
+        ""
+      ),
       tags: unique([
         ...detectMessageTags(message.content),
         ...inferReplyShapeTags(message.content),
         ...inferTopicTags(message.content)
       ]),
-      intents: ["general"]
+      intents: ["general"],
+      previous_assistant: "",
+      previous_assistant_act: "",
+      user_message_act: "",
+      assistant_message_act: detectMessageAct(message.content)
     }));
 
   return pickEvenlyDistributed(fallbackSamples, 24);
@@ -1519,7 +1710,530 @@ export function buildPersonaProfileFromWhatsApp(messages, personName) {
     style_samples: styleSamples,
     defaults: {
       temperature: 0.7,
-      enable_heuristic_replies: false
+      enable_heuristic_replies: true
     }
   });
+}
+
+function truncateEvidenceText(value, maxLength = 320) {
+  const normalized = compactWhitespace(value);
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}...`;
+}
+
+function sanitizeInteger(value, fallback, minimum = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= minimum ? Math.floor(parsed) : fallback;
+}
+
+function estimateGroqTokens(value) {
+  return Math.ceil(toText(value).length / 3);
+}
+
+function estimateGroqMessageTokens(messages) {
+  return toArray(messages).reduce((total, message) => {
+    return total + 4 + estimateGroqTokens(message?.role) + estimateGroqTokens(message?.content);
+  }, 2);
+}
+
+function buildPersonaExtractionPayload(baseProfile, limits = {}) {
+  const sampledExamples = pickEvenlyDistributed(
+    toArray(baseProfile.chat_examples),
+    limits.exampleLimit ?? 18
+  ).map((example) => ({
+    id: toText(example.id),
+    previous_assistant: truncateEvidenceText(example.previous_assistant, limits.previousAssistantChars ?? 180),
+    previous_assistant_act: toText(example.previous_assistant_act),
+    user: truncateEvidenceText(example.user, limits.userChars ?? 260),
+    assistant: truncateEvidenceText(example.assistant, limits.assistantChars ?? 220),
+    user_message_act: toText(example.user_message_act),
+    assistant_message_act: toText(example.assistant_message_act),
+    situation_type: toText(example.situation_type),
+    response_characteristics: toArray(example.response_characteristics)
+      .map((item) => toText(item))
+      .filter(Boolean),
+    personality_traits_shown: toArray(example.personality_traits_shown)
+      .map((item) => toText(item))
+      .filter(Boolean),
+    context_richness: toText(example.context_richness),
+    notes: truncateEvidenceText(example.notes, limits.notesChars ?? 180)
+  }));
+
+  return {
+    person_name: toText(baseProfile?.person?.name),
+    heuristic_summary: truncateEvidenceText(baseProfile?.person?.summary, limits.summaryChars ?? 220),
+    heuristic_relationship_to_user: truncateEvidenceText(
+      baseProfile?.person?.relationshipToUser,
+      limits.relationshipChars ?? 160
+    ),
+    heuristic_personality_traits: baseProfile?.personality_traits ?? {},
+    heuristic_conversation_habits: baseProfile?.conversation_habits ?? {},
+    heuristic_behavior_rules: toArray(baseProfile?.behavior_rules)
+      .map((item) => toText(item))
+      .filter(Boolean)
+      .slice(0, limits.behaviorRuleLimit ?? 8),
+    heuristic_situation_responses: toArray(baseProfile?.situation_responses).slice(
+      0,
+      limits.situationLimit ?? 8
+    ),
+    heuristic_knowledge_base: toArray(baseProfile?.knowledge_base)
+      .slice(0, limits.knowledgeLimit ?? 6)
+      .map((entry) => ({
+        ...entry,
+        title: truncateEvidenceText(entry?.title, 90),
+        content: truncateEvidenceText(entry?.content, limits.knowledgeChars ?? 180),
+        personal_significance: truncateEvidenceText(entry?.personal_significance, 90)
+      })),
+    speaking_style: toArray(baseProfile?.person?.speaking_style)
+      .map((item) => truncateEvidenceText(item, limits.speakingStyleChars ?? 90))
+      .filter(Boolean)
+      .slice(0, limits.speakingStyleLimit ?? 8),
+    signature_phrases: toArray(baseProfile?.person?.signature_phrases)
+      .map((item) => truncateEvidenceText(item, limits.signaturePhraseChars ?? 60))
+      .filter(Boolean)
+      .slice(0, limits.signaturePhraseLimit ?? 8),
+    style_samples: toArray(baseProfile?.style_samples)
+      .map((item) => truncateEvidenceText(item, limits.styleSampleChars ?? 140))
+      .filter(Boolean)
+      .slice(0, limits.styleSampleLimit ?? 10),
+    chat_examples: sampledExamples
+  };
+}
+
+function buildPersonaExtractionUserPrompt(extractionPayload) {
+  return `
+Analyze this WhatsApp-chat persona evidence and return a JSON object with this exact top-level shape:
+{
+  "person": {
+    "summary": "string",
+    "relationshipToUser": "string",
+    "speaking_style": ["string"],
+    "signature_phrases": ["string"]
+  },
+  "personality_traits": {
+    "humor": 0,
+    "confidence": 0,
+    "empathy": 0,
+    "directness": 0,
+    "verbosity": 0
+  },
+  "conversation_habits": {
+    "greetings": ["string"],
+    "closings": ["string"],
+    "abbreviations": ["string"],
+    "acknowledgement_patterns": ["string"],
+    "response_style": ["string"],
+    "punctuation_style": {
+      "exclamation": "light|medium|high",
+      "questions": "light|medium|high",
+      "ellipsis": "light|present|high"
+    },
+    "emoji_style": "rare|occasional|frequent"
+  },
+  "behavior_rules": ["string"],
+  "knowledge_base": [
+    {
+      "id": "string",
+      "title": "string",
+      "content": "string",
+      "tags": ["string"],
+      "personal_significance": "string",
+      "expertise_level": "low|medium|high|n/a",
+      "emotional_tone": "string",
+      "frequency": "low|medium|high"
+    }
+  ],
+  "situation_responses": [
+    {
+      "id": "one of the allowed ids",
+      "title": "string",
+      "summary": "string",
+      "guidance": "string",
+      "common_characteristics": ["string"],
+      "personality_traits_shown": ["string"],
+      "example_ids": ["string"],
+      "frequency": "low|medium|high"
+    }
+  ]
+}
+
+Evidence JSON:
+${JSON.stringify(extractionPayload, null, 2)}
+`.trim();
+}
+
+function selectPersonaExtractionRequest(baseProfile, systemPrompt) {
+  const maxTokensPerRequest = sanitizeInteger(
+    process.env.GROQ_PERSONA_MAX_TOKENS ?? process.env.MAX_TOKENS_PER_REQUEST,
+    7000,
+    1000
+  );
+  const responseTokenReserve = sanitizeInteger(process.env.GROQ_RESPONSE_TOKEN_RESERVE, 1200, 200);
+  const maxPromptTokens = Math.max(1000, maxTokensPerRequest - responseTokenReserve);
+  const variants = [
+    { mode: "full", limits: {} },
+    {
+      mode: "reduced",
+      limits: {
+        exampleLimit: 12,
+        styleSampleLimit: 8,
+        styleSampleChars: 110,
+        userChars: 220,
+        assistantChars: 180,
+        notesChars: 120,
+        knowledgeLimit: 4,
+        knowledgeChars: 140
+      }
+    },
+    {
+      mode: "compact",
+      limits: {
+        exampleLimit: 8,
+        styleSampleLimit: 6,
+        styleSampleChars: 90,
+        userChars: 180,
+        assistantChars: 140,
+        previousAssistantChars: 120,
+        notesChars: 90,
+        knowledgeLimit: 3,
+        knowledgeChars: 120,
+        situationLimit: 6,
+        behaviorRuleLimit: 6,
+        speakingStyleLimit: 5,
+        signaturePhraseLimit: 5
+      }
+    },
+    {
+      mode: "minimal",
+      limits: {
+        exampleLimit: 5,
+        styleSampleLimit: 4,
+        styleSampleChars: 70,
+        userChars: 120,
+        assistantChars: 110,
+        previousAssistantChars: 90,
+        notesChars: 70,
+        knowledgeLimit: 2,
+        knowledgeChars: 90,
+        situationLimit: 4,
+        behaviorRuleLimit: 4,
+        speakingStyleLimit: 4,
+        signaturePhraseLimit: 4,
+        summaryChars: 150,
+        relationshipChars: 100
+      }
+    }
+  ];
+
+  let selected = null;
+
+  for (const variant of variants) {
+    const extractionPayload = buildPersonaExtractionPayload(baseProfile, variant.limits);
+    const userPrompt = buildPersonaExtractionUserPrompt(extractionPayload);
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ];
+    const estimatedTokens = estimateGroqMessageTokens(messages);
+
+    selected = {
+      mode: variant.mode,
+      extractionPayload,
+      userPrompt,
+      messages,
+      estimatedTokens
+    };
+
+    if (estimatedTokens <= maxPromptTokens) {
+      return selected;
+    }
+  }
+
+  return selected;
+}
+
+function extractJsonObjectFromText(value) {
+  const normalized = toText(value);
+
+  if (!normalized) {
+    throw new Error("Groq returned an empty persona extraction response.");
+  }
+
+  try {
+    return JSON.parse(normalized);
+  } catch {
+    const startIndex = normalized.indexOf("{");
+    const endIndex = normalized.lastIndexOf("}");
+
+    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+      throw new Error("Groq persona extraction did not contain valid JSON.");
+    }
+
+    return JSON.parse(normalized.slice(startIndex, endIndex + 1));
+  }
+}
+
+function toScore(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? roundScore(value)
+    : fallback;
+}
+
+function mergeTraitScores(baseTraits, extractedTraits) {
+  return {
+    humor: toScore(
+      extractedTraits?.humor,
+      baseTraits?.humor ?? 0.3
+    ),
+    confidence: toScore(
+      extractedTraits?.confidence,
+      baseTraits?.confidence ?? 0.45
+    ),
+    empathy: toScore(
+      extractedTraits?.empathy,
+      baseTraits?.empathy ?? 0.35
+    ),
+    directness: toScore(
+      extractedTraits?.directness,
+      baseTraits?.directness ?? 0.5
+    ),
+    verbosity: toScore(
+      extractedTraits?.verbosity,
+      baseTraits?.verbosity ?? 0.35
+    )
+  };
+}
+
+function mergeUniqueTextArrays(...values) {
+  return unique(
+    values
+      .flatMap((value) => toArray(value))
+      .map((item) => toText(item))
+      .filter(Boolean)
+  );
+}
+
+function mergeConversationHabits(baseHabits, extractedHabits) {
+  const basePunctuation = baseHabits?.punctuation_style ?? {};
+  const extractedPunctuation = extractedHabits?.punctuation_style ?? {};
+
+  return {
+    greetings: mergeUniqueTextArrays(baseHabits?.greetings, extractedHabits?.greetings),
+    closings: mergeUniqueTextArrays(baseHabits?.closings, extractedHabits?.closings),
+    abbreviations: mergeUniqueTextArrays(baseHabits?.abbreviations, extractedHabits?.abbreviations),
+    acknowledgement_patterns: mergeUniqueTextArrays(
+      baseHabits?.acknowledgement_patterns,
+      extractedHabits?.acknowledgement_patterns
+    ),
+    response_style: mergeUniqueTextArrays(baseHabits?.response_style, extractedHabits?.response_style),
+    punctuation_style: {
+      exclamation: toText(extractedPunctuation.exclamation, toText(basePunctuation.exclamation, "light")),
+      questions: toText(extractedPunctuation.questions, toText(basePunctuation.questions, "medium")),
+      ellipsis: toText(extractedPunctuation.ellipsis, toText(basePunctuation.ellipsis, "light"))
+    },
+    emoji_style: toText(extractedHabits?.emoji_style, toText(baseHabits?.emoji_style, "rare"))
+  };
+}
+
+function mergeBehaviorRules(baseRules, extractedRules) {
+  return mergeUniqueTextArrays(baseRules, extractedRules).slice(0, 12);
+}
+
+function normalizeKnowledgeEntries(entries) {
+  return toArray(entries)
+    .map((entry, index) => {
+      const title = toText(entry?.title);
+      const content = toText(entry?.content);
+
+      if (!title || !content) {
+        return null;
+      }
+
+      return {
+        id: toText(entry?.id, `groq-knowledge-${index + 1}`),
+        title,
+        content,
+        tags: mergeUniqueTextArrays(entry?.tags).slice(0, 8),
+        personal_significance: toText(entry?.personal_significance),
+        expertise_level: toText(entry?.expertise_level),
+        emotional_tone: toText(entry?.emotional_tone),
+        frequency: toText(entry?.frequency)
+      };
+    })
+    .filter(Boolean);
+}
+
+function mergeKnowledgeEntries(baseEntries, extractedEntries) {
+  const merged = new Map();
+
+  for (const entry of [...normalizeKnowledgeEntries(extractedEntries), ...normalizeKnowledgeEntries(baseEntries)]) {
+    const key = `${toText(entry.id).toLowerCase()}::${toText(entry.title).toLowerCase()}`;
+
+    if (!merged.has(key)) {
+      merged.set(key, entry);
+    }
+  }
+
+  return [...merged.values()].slice(0, 12);
+}
+
+function normalizeSituationEntries(entries) {
+  return toArray(entries)
+    .map((entry, index) => {
+      const id = toText(entry?.id);
+      const title = toText(entry?.title);
+
+      if (!id || !title) {
+        return null;
+      }
+
+      return {
+        id,
+        title,
+        summary: toText(entry?.summary),
+        guidance: toText(entry?.guidance),
+        common_characteristics: mergeUniqueTextArrays(entry?.common_characteristics).slice(0, 6),
+        personality_traits_shown: mergeUniqueTextArrays(entry?.personality_traits_shown).slice(0, 5),
+        example_ids: mergeUniqueTextArrays(entry?.example_ids).slice(0, 6),
+        frequency: toText(entry?.frequency, "medium")
+      };
+    })
+    .filter(Boolean);
+}
+
+function mergeSituationEntries(baseEntries, extractedEntries) {
+  const merged = new Map();
+
+  for (const entry of [...normalizeSituationEntries(extractedEntries), ...normalizeSituationEntries(baseEntries)]) {
+    const key = toText(entry.id).toLowerCase();
+
+    if (!merged.has(key)) {
+      merged.set(key, entry);
+    }
+  }
+
+  return [...merged.values()].slice(0, 8);
+}
+
+function mergePersonaProfiles(baseProfile, extraction) {
+  const extractedPerson = extraction?.person ?? {};
+  const extractedSpeakingStyle = mergeUniqueTextArrays(
+    baseProfile?.person?.speaking_style,
+    extractedPerson?.speaking_style
+  );
+  const extractedSignaturePhrases = mergeUniqueTextArrays(
+    baseProfile?.person?.signature_phrases,
+    extractedPerson?.signature_phrases
+  ).slice(0, 10);
+
+  return enrichImportedPersonaProfile({
+    ...baseProfile,
+    person: {
+      ...baseProfile.person,
+      summary: toText(extractedPerson?.summary, toText(baseProfile?.person?.summary)),
+      relationshipToUser: toText(
+        extractedPerson?.relationshipToUser,
+        toText(baseProfile?.person?.relationshipToUser)
+      ),
+      speaking_style:
+        extractedSpeakingStyle.length > 0
+          ? extractedSpeakingStyle
+          : toArray(baseProfile?.person?.speaking_style),
+      signature_phrases:
+        extractedSignaturePhrases.length > 0
+          ? extractedSignaturePhrases
+          : toArray(baseProfile?.person?.signature_phrases)
+    },
+    personality_traits: mergeTraitScores(
+      baseProfile?.personality_traits,
+      extraction?.personality_traits
+    ),
+    conversation_habits: mergeConversationHabits(
+      baseProfile?.conversation_habits,
+      extraction?.conversation_habits
+    ),
+    behavior_rules: mergeBehaviorRules(baseProfile?.behavior_rules, extraction?.behavior_rules),
+    knowledge_base: mergeKnowledgeEntries(baseProfile?.knowledge_base, extraction?.knowledge_base),
+    situation_responses: mergeSituationEntries(
+      baseProfile?.situation_responses,
+      extraction?.situation_responses
+    )
+  });
+}
+
+async function extractPersonaMetadataWithGroq(baseProfile, options = {}) {
+  const apiKey = toText(options.apiKey);
+
+  if (!apiKey) {
+    return null;
+  }
+
+  const model = toText(options.model, "llama-3.3-70b-versatile");
+  const systemPrompt = `
+You are an expert analyst of WhatsApp chat behavior.
+Your job is to refine a persona profile from chat evidence without inventing unsupported backstory.
+Return strict JSON only.
+
+Important constraints:
+- Stay grounded in the supplied evidence only.
+- Prefer concise, specific behavior patterns over poetic summaries.
+- Keep all personality trait scores between 0 and 1.
+- Use only these situation ids when relevant:
+  question, request, bad-news, celebration, correction, general-chat, scheduling, problem-solving
+- If evidence is weak, keep fields conservative rather than generic.
+`.trim();
+  const extractionRequest = selectPersonaExtractionRequest(baseProfile, systemPrompt);
+  console.log(
+    `Persona extraction prompt tokens: ${extractionRequest.estimatedTokens} (${extractionRequest.mode})`
+  );
+
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      stream: false,
+      messages: extractionRequest.messages
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    if ((response.status === 400 || response.status === 413) && /token|context|maximum/i.test(errorText)) {
+      throw new Error(
+        "Groq persona extraction exceeded the model token limit. Try a smaller WhatsApp export or reduce persona evidence."
+      );
+    }
+    throw new Error(`Groq persona extraction failed: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  const rawContent = toText(data?.choices?.[0]?.message?.content);
+
+  return extractJsonObjectFromText(rawContent);
+}
+
+export async function buildPersonaProfileFromWhatsAppWithGroq(messages, personName, options = {}) {
+  const baseProfile = buildPersonaProfileFromWhatsApp(messages, personName);
+
+  try {
+    const extraction = await extractPersonaMetadataWithGroq(baseProfile, options);
+
+    if (!extraction || typeof extraction !== "object") {
+      return baseProfile;
+    }
+
+    return mergePersonaProfiles(baseProfile, extraction);
+  } catch (error) {
+    console.warn("Falling back to heuristic WhatsApp persona extraction:", error);
+    return baseProfile;
+  }
 }

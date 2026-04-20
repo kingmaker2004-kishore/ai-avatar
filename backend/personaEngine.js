@@ -203,7 +203,7 @@ const COLLOQUIAL_PATTERNS = [
   },
   {
     pattern: /\bpesalama\b/g,
-    aliases: ["talk", "call", "connect"]
+    aliases: ["talk"]
   },
   {
     pattern: /\biruka\b/g,
@@ -374,21 +374,13 @@ function inferMessageIntents(userMessage) {
 
   if (
     hasKeyword(lowerMessage, [
-      "connect",
-      "call",
-      "meet",
-      "meeting",
+      "timing",
       "tomorrow",
       "morning",
       "evening",
       "time",
       "free",
-      "gym",
-      "shuttle",
       "coming",
-      "come",
-      "go",
-      "join",
       "available",
       "plan"
     ])
@@ -398,12 +390,10 @@ function inferMessageIntents(userMessage) {
 
   if (
     hasKeyword(lowerMessage, [
-      "gym",
       "sleep",
       "breakfast",
       "lunch",
       "dinner",
-      "shuttle",
       "saptiya",
       "saaptiya",
       "eat",
@@ -485,50 +475,133 @@ function extractTimeReference(value) {
   return match ? match[0].replace(/\s+/g, " ").trim() : "";
 }
 
-function detectTopicFromText(value) {
-  const lowerMessage = expandColloquialText(value);
+function detectMessageAct(value) {
+  const normalized = expandColloquialText(value);
+  const wordCount = countWords(normalized);
 
-  if (hasKeyword(lowerMessage, ["shuttle"])) {
-    return "shuttle";
+  if (!normalized) {
+    return "statement";
   }
 
-  if (hasKeyword(lowerMessage, ["gym", "workout", "push day"])) {
-    return "gym";
+  if (/^(hi|hey|hello|gm|gn|good morning|good night|morning|night)\b/i.test(normalized)) {
+    return "greeting";
   }
 
-  if (hasKeyword(lowerMessage, ["call", "connect", "meet", "talk"])) {
-    return "call";
+  if (/^(no|nope|illa|illai|vendam|later|leave it)\b/i.test(normalized)) {
+    return "rejection";
   }
 
-  if (hasKeyword(lowerMessage, ["mail", "send", "sent", "share"])) {
-    return "mail";
+  if (/\b(sorry|my bad|apolog)\b/i.test(normalized)) {
+    return "apology";
   }
 
-  if (hasKeyword(lowerMessage, ["update", "done", "completed", "finished"])) {
-    return "work-status";
+  if (
+    hasKeyword(normalized, [
+      "not received",
+      "didn't",
+      "didnt",
+      "can't",
+      "cannot",
+      "unable",
+      "missed",
+      "late",
+      "wrong",
+      "seri illa",
+      "not like that",
+      "varala",
+      "kekala"
+    ])
+  ) {
+    return "complaint";
   }
 
-  return "";
-}
-
-function inferConversationTopic(userMessage, recentMessages) {
-  const directTopic = detectTopicFromText(userMessage);
-
-  if (directTopic) {
-    return directTopic;
+  if (
+    hasKeyword(normalized, [
+      "illa",
+      "wrong",
+      "not like that",
+      "should be",
+      "should've",
+      "poi illa",
+      "instead"
+    ])
+  ) {
+    return "correction";
   }
 
-  const recent = Array.isArray(recentMessages) ? [...recentMessages].reverse() : [];
-
-  for (const message of recent) {
-    const topic = detectTopicFromText(message?.content);
-
-    if (topic) {
-      return topic;
-    }
+  if (
+    /\b(?:free|available)\s+ah\b/i.test(normalized) ||
+    /\b(?:poriya|variya|varriya|irukiya|irukkiya|poviya|varuva|varuviya|venuma|mudiyuma|theriyuma|sollava|collage poriya)\b/i.test(
+      normalized
+    ) ||
+    /\b[a-z0-9]+\s+ah\b/i.test(normalized)
+  ) {
+    return "question";
   }
 
-  return "";
+  if (
+    normalized.includes("?") ||
+    /^(what|why|when|where|who|how|which|evalo|epo|eppo|enga)\b/i.test(normalized)
+  ) {
+    return "question";
+  }
+
+  if (
+    /^(ok|okay|kk|k|hmm|hm|mm|seri|sari|ryt|right|sure|fine|cool|done|ok da|okay da)\b/i.test(
+      normalized
+    ) &&
+    !normalized.includes("?") &&
+    wordCount <= 4
+  ) {
+    return "confirmation";
+  }
+
+  if (
+    /\b(let'?s|lets|shall we|can we|we can)\b/i.test(normalized) ||
+    /\b(polam|polaam|polama|variya)\b/i.test(normalized)
+  ) {
+    return "proposal";
+  }
+
+  if (
+    /\b(can you|could you|please|need you|help me)\b/i.test(normalized) ||
+    /^(send|share|check|come|give|tell|make|bring|put|confirm|book|transfer)\b/i.test(
+      normalized
+    )
+  ) {
+    return "request";
+  }
+
+  if (
+    hasKeyword(normalized, [
+      "done",
+      "completed",
+      "finished",
+      "sent",
+      "started",
+      "reached",
+      "left",
+      "booked",
+      "coming",
+      "on the way"
+    ])
+  ) {
+    return "update";
+  }
+
+  if (
+    wordCount <= 3 &&
+    (/\b\d{1,2}(?::|\.)?\d{0,2}\s*(?:am|pm)?\b/i.test(normalized) ||
+      /^(time|timing|amount|price|place|location|address|details?)\b/i.test(normalized))
+  ) {
+    return "detail-request";
+  }
+
+  if (wordCount <= 4) {
+    return "detail";
+  }
+
+  return "statement";
 }
 
 function getLastAssistantMessage(recentMessages) {
@@ -543,22 +616,81 @@ function getLastAssistantMessage(recentMessages) {
   return "";
 }
 
-function detectAssistantPromptType(value) {
-  const lowerMessage = expandColloquialText(value);
+function getLastUserMessage(recentMessages) {
+  const recent = Array.isArray(recentMessages) ? [...recentMessages].reverse() : [];
 
-  if (hasKeyword(lowerMessage, ["enna time", "time sollu", "what time"])) {
-    return "ask-time";
-  }
-
-  if (hasKeyword(lowerMessage, ["coming ah", "come", "join", "variya"])) {
-    return "ask-availability";
-  }
-
-  if (hasKeyword(lowerMessage, ["gym ah", "shuttle ah", "pesalaam", "polaam"])) {
-    return "suggest-plan";
+  for (const message of recent) {
+    if (message?.role === "user" && toText(message?.content)) {
+      return toText(message.content);
+    }
   }
 
   return "";
+}
+
+function getConversationState(userMessage, recentMessages = []) {
+  const lastAssistantMessage = getLastAssistantMessage(recentMessages);
+  const lastUserMessage = getLastUserMessage(recentMessages);
+  const currentUserAct = detectMessageAct(userMessage);
+  const lastAssistantAct = detectMessageAct(lastAssistantMessage);
+  const lastUserAct = detectMessageAct(lastUserMessage);
+
+  let pendingState = "";
+
+  if (
+    lastAssistantAct === "question" &&
+    ["detail", "detail-request", "statement", "update", "confirmation", "question"].includes(
+      currentUserAct
+    )
+  ) {
+    pendingState = "answering-question";
+  }
+
+  if (
+    !pendingState &&
+    lastUserAct === "request" &&
+    ["confirmation", "statement", "update"].includes(lastAssistantAct) &&
+    ["complaint", "correction", "detail", "detail-request", "question"].includes(currentUserAct)
+  ) {
+    pendingState = "unresolved-request-follow-up";
+  }
+
+  if (
+    !pendingState &&
+    ["confirmation", "update", "statement"].includes(lastAssistantAct) &&
+    currentUserAct === "complaint"
+  ) {
+    pendingState = "challenge-after-claim";
+  }
+
+  if (
+    !pendingState &&
+    ["proposal", "confirmation", "statement"].includes(lastAssistantAct) &&
+    currentUserAct === "detail-request"
+  ) {
+    pendingState = "proposal-follow-up";
+  }
+
+  if (
+    !pendingState &&
+    ["detail", "statement"].includes(lastAssistantAct) &&
+    currentUserAct === "correction"
+  ) {
+    pendingState = "correction-after-detail";
+  }
+
+  if (!pendingState && currentUserAct === "detail" && countWords(userMessage) <= 3) {
+    pendingState = "short-follow-up";
+  }
+
+  return {
+    lastAssistantMessage,
+    lastUserMessage,
+    currentUserAct,
+    lastAssistantAct,
+    lastUserAct,
+    pendingState
+  };
 }
 
 function isAffirmativeReply(value) {
@@ -594,25 +726,21 @@ function shouldUseShortCasualMode(userMessage, messageIntents, queryTokens) {
       "looked"
     ]);
   const hasShortCue = hasKeyword(lowerMessage, [
-    "gym",
     "free",
     "coming",
-    "come",
-    "call",
-    "connect",
     "time",
+    "timing",
     "update",
     "done",
     "sent",
-    "mail",
-    "saptiya",
-    "saaptiya",
-    "enga",
     "where",
     "when",
     "morning",
     "evening",
-    "shuttle"
+    "check",
+    "share",
+    "today",
+    "tomorrow"
   ]);
 
   return (
@@ -664,7 +792,7 @@ export function analyzePersonaReplyNeed(userMessage, recentMessages = []) {
     ]) ||
       (Boolean(topicHint) && lowerMessage.includes("?")));
   const lastAssistantMessage = getLastAssistantMessage(recentMessages);
-  const lastPromptType = detectAssistantPromptType(lastAssistantMessage);
+  const lastAssistantAct = detectMessageAct(lastAssistantMessage);
 
   if (broadTopicCheck) {
     return {
@@ -690,7 +818,7 @@ export function analyzePersonaReplyNeed(userMessage, recentMessages = []) {
     };
   }
 
-  if (lastPromptType && /^(what|who|where|why|how)\b/i.test(normalizedMessage)) {
+  if (lastAssistantAct === "question" && /^(what|who|where|why|how)\b/i.test(normalizedMessage)) {
     return {
       responseMode: "follow-up-question",
       topicHint,
@@ -848,11 +976,15 @@ export function normalizePersonaProfile(rawProfile, resolvedPath = "runtime") {
     })),
     chatExamples: toArray(rawProfile?.chat_examples).map((item, index) => ({
       id: toText(item?.id, `example-${index + 1}`),
+      previousAssistant: toText(item?.previous_assistant),
+      previousAssistantAct: toText(item?.previous_assistant_act),
       user: toText(item?.user),
       assistant: toText(item?.assistant),
       notes: toText(item?.notes),
       tags: unique(toArray(item?.tags).map((tag) => toText(tag)).filter(Boolean)),
       intents: unique(toArray(item?.intents).map((intent) => toText(intent)).filter(Boolean)),
+      userMessageAct: toText(item?.user_message_act),
+      assistantMessageAct: toText(item?.assistant_message_act),
       situationType: toText(item?.situation_type),
       responseCharacteristics: unique(
         toArray(item?.response_characteristics).map((entry) => toText(entry)).filter(Boolean)
@@ -931,24 +1063,14 @@ function getDominantPersonalityTraits(profile) {
 
 function detectSituationType(userMessage) {
   const normalized = expandColloquialText(userMessage);
+  const userAct = detectMessageAct(userMessage);
 
-  if (
-    hasKeyword(normalized, [
-      "sorry",
-      "failed",
-      "not working",
-      "late",
-      "can't",
-      "cannot",
-      "unable",
-      "mistake",
-      "missed"
-    ])
-  ) {
+  if (["apology", "complaint"].includes(userAct)) {
     return "bad-news";
   }
 
   if (
+    userAct === "update" &&
     hasKeyword(normalized, ["done", "completed", "finished", "selected", "won", "success", "finally"])
   ) {
     return "celebration";
@@ -958,43 +1080,131 @@ function detectSituationType(userMessage) {
     return "problem-solving";
   }
 
+  if (userAct === "correction") {
+    return "correction";
+  }
+
   if (
     hasKeyword(normalized, [
       "free",
       "available",
       "time",
+      "timing",
       "today",
       "tomorrow",
       "morning",
       "evening",
-      "call",
-      "connect",
-      "meet"
+      "schedule",
+      "plan"
     ])
   ) {
     return "scheduling";
   }
 
-  if (
-    hasKeyword(normalized, [
-      "please",
-      "send",
-      "share",
-      "check",
-      "help me",
-      "can you",
-      "could you",
-      "come"
-    ])
-  ) {
+  if (userAct === "request" || userAct === "proposal") {
     return "request";
   }
 
-  if (/^(what|why|when|where|who|how)\b/i.test(toText(userMessage)) || normalized.includes("?")) {
+  if (userAct === "question" || userAct === "detail-request") {
     return "question";
   }
 
   return "general-chat";
+}
+
+function getExpectedReplyActs(currentUserAct, lastAssistantAct, pendingState) {
+  if (pendingState === "answering-question") {
+    return ["statement", "update", "confirmation", "detail"];
+  }
+
+  if (pendingState === "unresolved-request-follow-up") {
+    return ["question", "statement", "confirmation", "detail"];
+  }
+
+  if (pendingState === "challenge-after-claim") {
+    return ["statement", "question", "confirmation", "request"];
+  }
+
+  if (pendingState === "proposal-follow-up") {
+    return ["detail", "statement", "question"];
+  }
+
+  if (pendingState === "correction-after-detail") {
+    return ["confirmation", "statement", "detail"];
+  }
+
+  if (lastAssistantAct === "question") {
+    return ["statement", "detail", "update", "confirmation"];
+  }
+
+  switch (currentUserAct) {
+    case "question":
+    case "detail-request":
+      return ["statement", "detail", "question"];
+    case "request":
+    case "proposal":
+      return ["confirmation", "question", "rejection", "statement"];
+    case "complaint":
+    case "correction":
+      return ["statement", "question", "confirmation"];
+    case "update":
+    case "detail":
+      return ["confirmation", "statement", "question"];
+    case "confirmation":
+      return ["question", "statement", "confirmation"];
+    case "rejection":
+      return ["statement", "confirmation"];
+    default:
+      return ["statement", "confirmation", "question"];
+  }
+}
+
+function scoreConversationActMatch(item, conversationState) {
+  const itemUserAct = toText(item.userMessageAct);
+  const itemAssistantAct = toText(item.assistantMessageAct);
+  const itemPreviousAssistantAct = toText(item.previousAssistantAct);
+  const expectedReplyActs = getExpectedReplyActs(
+    conversationState.currentUserAct,
+    conversationState.lastAssistantAct,
+    conversationState.pendingState
+  );
+  const compatibleUserActs = new Set([conversationState.currentUserAct]);
+
+  if (conversationState.currentUserAct === "question") {
+    compatibleUserActs.add("detail-request");
+  }
+
+  if (conversationState.currentUserAct === "detail-request") {
+    compatibleUserActs.add("question");
+  }
+
+  if (conversationState.currentUserAct === "complaint") {
+    compatibleUserActs.add("correction");
+  }
+
+  if (conversationState.currentUserAct === "correction") {
+    compatibleUserActs.add("complaint");
+  }
+
+  let score = 0;
+
+  if (itemUserAct && compatibleUserActs.has(itemUserAct)) {
+    score += 7;
+  }
+
+  if (itemAssistantAct && expectedReplyActs.includes(itemAssistantAct)) {
+    score += 5;
+  }
+
+  if (
+    conversationState.lastAssistantAct &&
+    itemPreviousAssistantAct &&
+    conversationState.lastAssistantAct === itemPreviousAssistantAct
+  ) {
+    score += 4;
+  }
+
+  return score;
 }
 
 function scoreSituationMatch(item, queryTokens, currentSituation, messageIntents) {
@@ -1021,17 +1231,22 @@ function scoreExampleMatch(
   item,
   queryTokens,
   messageIntents,
-  detectedTopic = "",
+  conversationState = {},
   currentSituation = "",
   dominantTraits = []
 ) {
+  const previousAssistantScore = scoreText(
+    tokenize(conversationState.lastAssistantMessage ?? ""),
+    item.previousAssistant
+  );
   const userScore = scoreText(queryTokens, item.user) * 4;
   const assistantScore = scoreText(queryTokens, item.assistant) * 2;
   const notesScore = scoreText(queryTokens, item.notes);
   const tagScore = scoreTags(queryTokens, item.tags);
   const intentScore = countIntentOverlap(messageIntents, item.intents) * 5;
 
-  let score = userScore + assistantScore + notesScore + tagScore + intentScore;
+  let score =
+    userScore + assistantScore + notesScore + tagScore + intentScore + previousAssistantScore * 5;
 
   const itemTags = new Set(item.tags);
   const itemIntents = new Set(item.intents);
@@ -1059,9 +1274,7 @@ function scoreExampleMatch(
     score += 7;
   }
 
-  if (detectedTopic && itemTags.has(detectedTopic)) {
-    score += 6;
-  }
+  score += scoreConversationActMatch(item, conversationState);
 
   score += countIntentOverlap(dominantTraits, item.personalityTraitsShown ?? []) * 2;
 
@@ -1089,12 +1302,12 @@ function scoreExampleMatch(
   return score;
 }
 
-export function retrievePersonaContext(profile, userMessage, maxItems = 6) {
+export function retrievePersonaContext(profile, userMessage, maxItems = 6, recentMessages = []) {
   const messageIntents = inferMessageIntents(userMessage);
   const queryTokens = buildRetrievalTokens(userMessage, messageIntents);
   const shortReplyMode = shouldUseShortCasualMode(userMessage, messageIntents, queryTokens);
-  const detectedTopic = detectTopicFromText(userMessage);
   const currentSituation = detectSituationType(userMessage);
+  const conversationState = getConversationState(userMessage, recentMessages);
   const dominantTraits = getDominantPersonalityTraits(profile);
   const knowledgeMatches = rankItems(profile.knowledgeBase, queryTokens, (item, tokens) => {
     return scoreText(tokens, `${item.title} ${item.content}`) + scoreTags(tokens, item.tags);
@@ -1113,7 +1326,7 @@ export function retrievePersonaContext(profile, userMessage, maxItems = 6) {
       item,
       tokens,
       messageIntents,
-      detectedTopic,
+      conversationState,
       currentSituation,
       dominantTraits
     )
@@ -1125,46 +1338,139 @@ export function retrievePersonaContext(profile, userMessage, maxItems = 6) {
     situations: situationMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
     examples: exampleMatches.slice(0, Math.min(3, maxItems)).map((entry) => entry.item),
     currentSituation,
+    currentUserAct: conversationState.currentUserAct,
+    lastAssistantAct: conversationState.lastAssistantAct,
+    pendingState: conversationState.pendingState,
     messageIntents,
     shortReplyMode
   };
 }
 
-function buildTimeConfirmationReply(topic, timeReference) {
-  if (!timeReference) {
-    return "";
+function isCompatibleMessageAct(exampleAct, currentAct) {
+  if (!exampleAct || !currentAct) {
+    return false;
   }
 
-  switch (topic) {
-    case "shuttle":
-      return `Ryt\n${timeReference} shuttle`;
-    case "gym":
-      return `Ryt\n${timeReference} ku vaa`;
-    case "call":
-      return `Ryt\n${timeReference} la pesalaam`;
-    default:
-      return `Ryt\n${timeReference} okay`;
+  if (exampleAct === currentAct) {
+    return true;
   }
+
+  const pairs = [
+    ["question", "detail-request"],
+    ["detail-request", "question"],
+    ["complaint", "correction"],
+    ["correction", "complaint"]
+  ];
+
+  return pairs.some(([left, right]) => left === exampleAct && right === currentAct);
 }
 
-export function buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext) {
+function pickReusableFastPathExample(examples, conversationState, currentSituation) {
+  for (const example of toArray(examples)) {
+    if (!toText(example?.assistant) || countWords(example.assistant) > 14) {
+      continue;
+    }
+
+    // Filter out examples that are topic-specific unless the current context mentions that topic
+    const exampleText = `${example.user} ${example.assistant} ${example.notes || ""}`.toLowerCase();
+    const isFoodRelated = exampleText.includes("saapadu") || exampleText.includes("eat") || exampleText.includes("food");
+    const isWorkRelated = exampleText.includes("work") || exampleText.includes("send") || exampleText.includes("code");
+    
+    // Don't use topic-specific examples unless the conversation is about that topic
+    if (isFoodRelated && !conversationState.lastUserMessage?.toLowerCase().includes("eat|food|saapadu")) {
+      continue;
+    }
+    if (isWorkRelated && !conversationState.lastUserMessage?.toLowerCase().includes("work|send|code|task")) {
+      continue;
+    }
+
+    if (
+      currentSituation &&
+      currentSituation !== "general-chat" &&
+      toText(example?.situationType) &&
+      example.situationType !== currentSituation
+    ) {
+      continue;
+    }
+
+    if (
+      conversationState.currentUserAct &&
+      toText(example?.userMessageAct) &&
+      !isCompatibleMessageAct(example.userMessageAct, conversationState.currentUserAct)
+    ) {
+      continue;
+    }
+
+    if (
+      conversationState.lastAssistantMessage &&
+      conversationState.pendingState === "answering-question" &&
+      !toText(example?.previousAssistant)
+    ) {
+      continue;
+    }
+
+    return example;
+  }
+
+  return null;
+}
+
+export function buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext, profile) {
   const normalizedMessage = toText(userMessage);
   const lowerMessage = expandColloquialText(normalizedMessage);
   const timeReference = extractTimeReference(normalizedMessage);
-  const topic = inferConversationTopic(userMessage, recentMessages);
-  const lastAssistantMessage = getLastAssistantMessage(recentMessages);
-  const lastPromptType = detectAssistantPromptType(lastAssistantMessage);
+  const conversationState = getConversationState(userMessage, recentMessages);
+  const wordCount = countWords(normalizedMessage);
+  
+  // Use persona's signature phrases and abbreviations if available
+  const personaAbbreviations = profile?.conversationHabits?.abbreviations || [];
+  const personaAcknowledgements = profile?.conversationHabits?.acknowledgementPatterns || [];
+  const personaSignatures = profile?.person?.signaturePhrases || [];
+  
+  // Get default fallback phrases - prefer persona's actual phrases
+  const fallbackAcknowledge = personaAbbreviations[0] || personaAcknowledgements[0] || "Ok";
+  const fallbackQuestion = personaAbbreviations.includes("enna") ? "Enna venum" : "Enna detail?";
+  const fallbackCheck = personaSignatures.includes("Naa Podala") ? "Check pannu" : "Check pannu";
+  
+  // CRITICAL: Don't use heuristic reply for messages expressing intent, need, or desire
+  const expressesIntent = /want|need|talk|please|help|ask|discuss|say|tell|explain|understand/i.test(normalizedMessage);
+  const expressesFeeling = /feel|think|believe|seem|look|seem|appear/i.test(normalizedMessage);
+  
+  // CRITICAL: Don't use heuristic reply if the user is asking a substantive question or expressing clear intent
+  const isSubstantiveQuestion = /^(how|what|why|when|where|which|who|do you|can you|will you|should|tell|explain|describe)/i.test(normalizedMessage);
+  const isNegativeSentiment = /^(no|nope|dont|don't|nothing|illa|illai|vendam|nah)/i.test(normalizedMessage);
+  const isComplexStatement = wordCount > 4 && (/i dont want|i don't want|nothing|don't need|not interested|dont need|just need to|need to talk/i.test(normalizedMessage) || (expressesIntent && wordCount > 3));
+  
+  // If message expresses intent/feeling and has more than 3 words, let LLM handle it
+  if ((expressesIntent || expressesFeeling || isComplexStatement || isSubstantiveQuestion) && wordCount > 3) {
+    return ""; // Let LLM handle intentful statements
+  }
+  
   const allowFastPath =
     retrievedContext?.shortReplyMode ||
-    (timeReference && ["shuttle", "gym", "call"].includes(topic)) ||
-    ((isAffirmativeReply(normalizedMessage) || isNegativeReply(normalizedMessage)) &&
-      (Boolean(topic) || Boolean(lastPromptType)));
+    Boolean(conversationState.pendingState) ||
+    Boolean(timeReference) ||
+    isAffirmativeReply(normalizedMessage) ||
+    isNegativeReply(normalizedMessage) ||
+    ["question", "detail-request", "complaint", "correction", "detail"].includes(
+      conversationState.currentUserAct
+    );
 
   if (!allowFastPath) {
     return "";
   }
 
-  const wordCount = countWords(normalizedMessage);
+  // For complex negatives, don't use examples
+  if (isNegativeSentiment && wordCount > 2) {
+    return "";
+  }
+
+  const reusableExample = pickReusableFastPathExample(
+    retrievedContext?.examples,
+    conversationState,
+    retrievedContext?.currentSituation
+  );
+  
   const isConfirmation =
     timeReference &&
     (/\bok\b/i.test(normalizedMessage) ||
@@ -1173,84 +1479,75 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
       wordCount <= 4);
 
   if (isAffirmativeReply(normalizedMessage)) {
-    if (lastPromptType === "ask-time") {
-      return "Time sollu paa";
+    if (conversationState.lastAssistantAct === "question") {
+      return reusableExample?.assistant || fallbackAcknowledge;
     }
 
-    if (lastPromptType === "ask-availability") {
-      if (topic === "shuttle") {
-        return "Ryt\nShuttle ku vaa";
-      }
-
-      if (topic === "gym") {
-        return "Ryt\nVaa";
-      }
-
-      return "Ryt\nVaa";
+    if (conversationState.lastAssistantAct === "proposal") {
+      return reusableExample?.assistant || (personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge);
     }
 
-    if (lastPromptType === "suggest-plan") {
-      return "Ryt";
-    }
-
-    return topic === "mail" || topic === "work-status" ? "Ryt" : "Okay";
+    return reusableExample?.assistant || fallbackAcknowledge;
   }
 
   if (isNegativeReply(normalizedMessage)) {
-    if (lastPromptType === "ask-time" || lastPromptType === "ask-availability") {
-      return "Seri\nLemme know later";
+    // For negative replies with complex context or more than one word, let LLM handle it
+    if (isComplexStatement || wordCount > 2) {
+      return "";
+    }
+    
+    if (conversationState.lastAssistantAct === "question" || conversationState.lastAssistantAct === "proposal") {
+      const negativeFallback = personaAbbreviations.includes("seri") 
+        ? "Seri\nLater sollu" 
+        : fallbackAcknowledge + "\nLater";
+      return reusableExample?.assistant || negativeFallback;
     }
 
-    return "Okay";
+    return reusableExample?.assistant || (personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge);
   }
 
   if (isConfirmation) {
-    return buildTimeConfirmationReply(topic, timeReference);
+    return reusableExample?.assistant || `${fallbackAcknowledge}\n${timeReference}`;
   }
 
-  if (topic === "gym") {
-    if (hasKeyword(lowerMessage, ["evening"])) {
-      return "Evening vendam paa\nMorning naa 5 to 7 dhaan";
-    }
-
-    if (hasKeyword(lowerMessage, ["morning"])) {
-      return "Morning la polaam\n5 to 7 dhaan";
-    }
-
-    if (hasKeyword(lowerMessage, ["come", "coming", "join", "plan", "go", "gym"])) {
-      return "Gym ah?\nMorning naa 5 to 7 dhaan";
-    }
+  if (conversationState.pendingState === "challenge-after-claim") {
+    return reusableExample?.assistant || fallbackCheck;
   }
 
-  if (topic === "shuttle") {
-    if (timeReference) {
-      return buildTimeConfirmationReply(topic, timeReference);
-    }
-
-    if (hasKeyword(lowerMessage, ["come", "coming", "join", "shuttle", "available"])) {
-      return "Shuttle ah?\nEnna time?";
-    }
+  if (conversationState.pendingState === "proposal-follow-up") {
+    // Don't use generic examples for follow-ups - needs context
+    return "";
   }
 
-  if (topic === "call") {
-    if (timeReference) {
-      return buildTimeConfirmationReply(topic, timeReference);
-    }
+  if (conversationState.pendingState === "correction-after-detail") {
+    return reusableExample?.assistant || (personaAbbreviations.includes("seri") ? "Seri seri" : "Ok ok");
+  }
 
-    if (hasKeyword(lowerMessage, ["call", "connect", "talk", "meet"])) {
-      return "Pesalaam\nEnna time?";
+  if (
+    conversationState.pendingState === "answering-question" ||
+    conversationState.pendingState === "unresolved-request-follow-up" ||
+    conversationState.pendingState === "short-follow-up"
+  ) {
+    if (reusableExample?.assistant) {
+      return reusableExample.assistant;
     }
   }
 
-  if (hasKeyword(lowerMessage, ["free", "available"])) {
-    if (hasKeyword(lowerMessage, ["today", "tomorrow"])) {
-      return "Enna plan?";
-    }
-
-    return "Time sollu";
+  if (conversationState.currentUserAct === "detail-request") {
+    // Don't use examples for detail requests - needs understanding
+    return "";
   }
 
-  return "";
+  if (conversationState.currentUserAct === "complaint") {
+    return reusableExample?.assistant || fallbackCheck;
+  }
+
+  if (conversationState.currentUserAct === "question" && wordCount <= 3) {
+    // For very short questions, prefer example-based reply
+    return reusableExample?.assistant || "";
+  }
+
+  return reusableExample?.assistant || "";
 }
 
 function formatList(items) {
@@ -1354,11 +1651,19 @@ function formatExamples(examples) {
   return examples
     .map(
       (item) =>
-        `- ${item.user ? `User: ${item.user}` : "User context: unavailable"}\n  ${
+        `- ${item.previousAssistant ? `Previous assistant: ${item.previousAssistant}\n  ` : ""}${
+          item.user ? `User: ${item.user}` : "User context: unavailable"
+        }\n  ${
           item.assistant ? `Reply: ${item.assistant}` : "Reply: n/a"
         }${
           item.notes ? `\n  Notes: ${item.notes}` : ""
         }${item.intents.length ? `\n  Intents: ${item.intents.join(", ")}` : ""}${
+          item.previousAssistantAct ? `\n  Previous assistant act: ${item.previousAssistantAct}` : ""
+        }${
+          item.userMessageAct ? `\n  User act: ${item.userMessageAct}` : ""
+        }${
+          item.assistantMessageAct ? `\n  Reply act: ${item.assistantMessageAct}` : ""
+        }${
           item.tags.length ? `\n  Tags: ${item.tags.join(", ")}` : ""
         }${item.situationType ? `\n  Situation: ${item.situationType}` : ""}${
           item.responseCharacteristics.length
@@ -1403,6 +1708,17 @@ export function buildPersonaPrompt(profile, retrievedContext, messageNeed) {
     topicHint: "",
     guidance: []
   };
+  
+  // Build signature phrase instruction with examples
+  const signaturePhrasesFormatted = person.signaturePhrases && person.signaturePhrases.length > 0
+    ? `Signature phrases to use naturally when appropriate: ${person.signaturePhrases.join(", ")}\n- Use these phrases when they fit the conversational moment; do not force them.\n- These are how ${person.name} naturally ends or responds in matching situations.`
+    : "Signature phrases: (none extracted)";
+  
+  // Build acknowledgement patterns instruction
+  const acknowledgements = profile.conversationHabits?.acknowledgementPatterns || [];
+  const acknowledgementInstruction = acknowledgements.length > 0
+    ? `\nCommon acknowledgement replies: ${acknowledgements.join(", ")}\n- Use brief acknowledgements like these for quick confirmations or short follow-ups.\n- These match how ${person.name} naturally confirms or acknowledges.`
+    : "";
 
   return `
 You are speaking as ${person.name}.
@@ -1415,6 +1731,7 @@ Primary objective:
 - Sound human, specific, and emotionally consistent with the source material.
 - Keep the answer faithful to the person's known knowledge, memories, and tone.
 - Prefer the exact chat rhythm from the examples over generic polished writing.
+- When appropriate, use the characteristic short replies and signature phrases shown below.
 
 Rules:
 ${formatList(profile.behaviorRules)}
@@ -1422,8 +1739,7 @@ ${formatList(profile.behaviorRules)}
 Speaking style:
 ${formatList(person.speakingStyle)}
 
-Signature phrases:
-${formatList(person.signaturePhrases)}
+${signaturePhrasesFormatted}${acknowledgementInstruction}
 
 Avoid:
 ${formatList(person.doNotDo)}
@@ -1442,6 +1758,11 @@ ${formatStyleSamples(profile.styleSamples)}
 
 Current user-message cues:
 ${formatList(retrievedContext.messageIntents)}
+
+Current conversation acts:
+- Current user act: ${retrievedContext.currentUserAct || "statement"}
+- Previous assistant act: ${retrievedContext.lastAssistantAct || "none"}
+- Pending flow: ${retrievedContext.pendingState || "none"}
 
 Personality traits:
 ${formatPersonalityTraits(profile.personalityTraits)}
@@ -1462,7 +1783,14 @@ Reply mode:
 - ${retrievedContext.shortReplyMode ? "Short casual WhatsApp reply." : "Normal persona reply."}
 
 Response guidelines:
-- First answer the user's current message clearly; style imitation comes after relevance.
+- **PRIORITY 1: Answer the user's literal question first.** Ignore style, just answer what they asked.
+- **PRIORITY 2: Match the persona's speaking style.** Only after the answer is clear, apply the tone.
+- Never use signature phrases when they make the reply irrelevant or off-topic.
+- If a question is asked, either answer it or ask for clarification. Do not ignore the question.
+- "Mm" is ONLY appropriate for: brief acknowledgements, yes/no after answering something, or when the previous message was already answered.
+- "Mm" is NOT appropriate for: answering questions (like "how are you?"), responding to greetings that expect more, or when the user is asking for information.
+- For greeting messages like "hi" or "hi da", check the conversation flow. If it's a fresh start, ask where they are or what they're up to (like "Naa podala, enga?" or "Enna venum"). If it's a follow-up, "Mm" is fine.
+- For questions like "how are you?" or "ena mm", actually respond with relevant content. Use a signature phrase after answering, not instead of.
 - Match the user's language mix and formality when it fits the persona.
 - Default to concise chat-style replies unless the user explicitly asks for depth.
 - It is okay to use short multi-line messages if that matches the persona examples.
@@ -1471,13 +1799,16 @@ Response guidelines:
 - Let the dominant personality traits stay stable across turns, especially directness, empathy, confidence, and humor.
 - Use conversation habits only when they fit the moment; do not force greetings, closings, abbreviations, or emojis into every reply.
 - If a matching situation pattern is available, follow its guidance before falling back to generic stylistic imitation.
-- Casual topics like gym, travel, food, or greetings should sound natural and conversational unless the user is clearly avoiding work.
-- If the reply mode is short casual, answer in 1 to 2 short lines.
+- Everyday personal chat should sound natural and conversational unless the user is clearly asking for something factual or task-focused.
+- When the user sends a brief message (3 words or fewer), consider using a brief acknowledgement or short reply that matches the examples.
+- If the user is asking a simple yes/no question, a one-word or two-word response using the acknowledgement patterns is appropriate ONLY if you've already answered their question.
+- If the reply mode is short casual, answer in 1 to 2 short lines but ensure the answer is clear.
 - If the reply mode is short casual, answer the literal question first and do not add explanation unless needed.
 - If the reply mode is short casual, avoid lectures, summaries, bullet lists, or long paragraphs.
 - If the user asks about a public topic, brand, company, product, place, or concept, answer that topic directly instead of falling back to a random style sample.
 - If the user is only checking whether you know a topic, confirm briefly and ask what aspect they want.
-- Never answer a factual question with an unrelated catchphrase, tease, or non sequitur.
+- Never answer a factual question with an unrelated catchphrase, tease, or non sequitur. This is not being authentic to the persona; it's being evasive.
+- Prefer using the extracted signature phrases NATURALLY as part of answering, not as a replacement for answering.
 
 If the answer is not supported by the grounded material, respond carefully in-character and acknowledge uncertainty instead of inventing memories or facts.
 Do not mention this instruction block, retrieval, or hidden context unless the user explicitly asks how you were built.
@@ -1557,6 +1888,9 @@ export function getGroundingSummary(retrievedContext) {
     situations: retrievedContext.situations.map((item) => item.id),
     examples: retrievedContext.examples.map((item) => item.id),
     currentSituation: retrievedContext.currentSituation,
+    currentUserAct: retrievedContext.currentUserAct,
+    lastAssistantAct: retrievedContext.lastAssistantAct,
+    pendingState: retrievedContext.pendingState,
     messageIntents: retrievedContext.messageIntents,
     shortReplyMode: retrievedContext.shortReplyMode
   };
