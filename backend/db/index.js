@@ -286,6 +286,19 @@ class ChatDatabase {
   }
 
   /**
+   * Archive every active conversation for a user.
+   * Used when changing persona so old persona chats cannot leak into the new one.
+   */
+  archiveUserConversations(userId) {
+    const stmt = this.db.prepare(
+      "UPDATE conversations SET archived = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND archived = 0"
+    );
+    const result = stmt.run(userId);
+
+    return result.changes;
+  }
+
+  /**
    * Search conversations by title (basic text search)
    */
   searchConversations(userId, query, limit = 20) {

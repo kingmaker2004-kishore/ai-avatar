@@ -32,6 +32,11 @@ Welcome to the AI Avatar project documentation! This folder contains comprehensi
 2. Follow [SETUP.md](SETUP.md) to run it locally
 3. Check [ARCHITECTURE.md](ARCHITECTURE.md) to understand how it works
 
+**Want to use Real-Time Evaluation?** ⭐ NEW
+1. Read [REALTIME_SUMMARY.md](./REALTIME_SUMMARY.md) for overview
+2. See [REALTIME_INTEGRATION.md](./REALTIME_INTEGRATION.md) for frontend code
+3. Follow [REALTIME_CHECKLIST.md](./REALTIME_CHECKLIST.md) to implement
+
 **Need to add a feature?**
 1. Review [ARCHITECTURE.md](ARCHITECTURE.md) for system design
 2. Check [COMPONENTS.md](COMPONENTS.md) for frontend components
@@ -57,6 +62,13 @@ Welcome to the AI Avatar project documentation! This folder contains comprehensi
 | DEPLOYMENT.md | DevOps, Administrators | Production setup, database, secrets, security |
 | TROUBLESHOOTING.md | All | Common issues, debugging, solutions |
 | CONTRIBUTING.md | Developers | Code style, feature development, PR process |
+| **REALTIME_SUMMARY.md** | **All** | **⭐ NEW: Real-time chat evaluation overview** |
+| REALTIME_EVALUATION.md | Developers | Complete real-time evaluation metrics & guide |
+| REALTIME_INTEGRATION.md | Frontend Developers | React component examples & integration code |
+| REALTIME_CHECKLIST.md | Developers | Implementation checklist & next steps |
+| EVALUATION.md | Developers | Batch evaluation framework for uploaded chats |
+| EVALUATION_FRONTEND.md | Frontend Developers | UI component templates for evaluation display |
+| QUICKSTART.md | All | 5-minute quick-start guide |
 
 ## 🔗 Related Resources
 

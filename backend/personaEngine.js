@@ -404,10 +404,18 @@ function inferMessageIntents(userMessage) {
       "coimbatore",
       "erode",
       "cold",
-      "travel"
+      "travel",
+      "movie",
+      "film",
+      "cinema",
+      "padam"
     ])
   ) {
     intents.push("casual");
+  }
+
+  if (hasKeyword(lowerMessage, ["movie", "film", "cinema", "padam", "mr x", "mrx"])) {
+    intents.push("entertainment");
   }
 
   if (hasKeyword(lowerMessage, ["sorry", "apolog", "mistake"])) {
@@ -694,7 +702,7 @@ function getConversationState(userMessage, recentMessages = []) {
 }
 
 function isAffirmativeReply(value) {
-  return /^(yes|yeah|yep|ok|okay|seri|sari|ryt|right|sure|vaa|varaen|coming)$/i.test(toText(value));
+  return /^(yes|yeah|yep|ok|okay|seri|sari|ryt|right|sure|vaa|varaen|coming|ama|aama|amam)$/i.test(toText(value));
 }
 
 function isNegativeReply(value) {
@@ -760,6 +768,204 @@ function formatMessageGuidance(guidance) {
   return guidance.map((item) => `- ${item}`).join("\n");
 }
 
+function hasSpecificTopicCue(normalizedMessage, queryTokens, topicHint) {
+  return (
+    Boolean(topicHint) ||
+    queryTokens.length >= 2 ||
+    hasKeyword(normalizedMessage, [
+      "today",
+      "tomorrow",
+      "morning",
+      "evening",
+      "time",
+      "price",
+      "feature",
+      "details",
+      "error",
+      "issue",
+      "problem",
+      "update",
+      "send",
+      "share",
+      "check",
+      "compare",
+      "movie",
+      "film",
+      "cinema",
+      "padam"
+    ])
+  );
+}
+
+function buildPersonaMessageAnalysis(userMessage, recentMessages = [], existingMessageNeed = null) {
+  const normalizedMessage = toText(userMessage);
+  const lowerMessage = expandColloquialText(normalizedMessage);
+  const messageIntents = inferMessageIntents(normalizedMessage);
+  const queryTokens = buildRetrievalTokens(normalizedMessage, messageIntents);
+  const conversationState = getConversationState(normalizedMessage, recentMessages);
+  const currentSituation = detectSituationType(normalizedMessage);
+  const topicHint = extractTopicHint(normalizedMessage);
+  const messageNeed =
+    existingMessageNeed ?? analyzePersonaReplyNeed(normalizedMessage, recentMessages);
+  const shortReplyMode = shouldUseShortCasualMode(normalizedMessage, messageIntents, queryTokens);
+  const wordCount = countWords(normalizedMessage);
+
+  return {
+    normalizedMessage,
+    lowerMessage,
+    messageIntents,
+    queryTokens,
+    conversationState,
+    currentSituation,
+    topicHint,
+    messageNeed,
+    shortReplyMode,
+    wordCount
+  };
+}
+
+function assessMessageClarity(userMessage, recentMessages = [], existingAnalysis = null) {
+  const analysis = existingAnalysis ?? buildPersonaMessageAnalysis(userMessage, recentMessages);
+  const {
+    normalizedMessage,
+    lowerMessage,
+    queryTokens,
+    messageIntents,
+    conversationState,
+    messageNeed,
+    topicHint,
+    wordCount
+  } = analysis;
+
+  const hasAmbiguousReference =
+    /\b(this|that|it|same|here|there|that one|this one)\b/i.test(normalizedMessage);
+  const isWorkLike = messageIntents.includes("work") || messageIntents.includes("help");
+  const isQuestionLike = ["question", "detail-request", "request", "proposal"].includes(
+    conversationState.currentUserAct
+  );
+  const hasContextThread =
+    Boolean(conversationState.pendingState) ||
+    Boolean(conversationState.lastAssistantMessage) ||
+    Boolean(conversationState.lastUserMessage);
+  const specificTopic = hasSpecificTopicCue(lowerMessage, queryTokens, topicHint);
+
+  if (messageNeed.responseMode === "clarify-topic") {
+    return {
+      shouldClarify: true,
+      reason: "broad-topic-check",
+      guidance:
+        "The user is checking topic familiarity first, so confirm and ask which aspect they want."
+    };
+  }
+
+  if (messageNeed.responseMode === "external-knowledge") {
+    return {
+      shouldClarify: false,
+      reason: "specific-knowledge-question",
+      guidance: "The user asked a direct factual question."
+    };
+  }
+
+  if (hasAmbiguousReference && !hasContextThread && !specificTopic) {
+    return {
+      shouldClarify: true,
+      reason: "ambiguous-reference",
+      guidance:
+        "The message depends on missing context, so ask a short clarifying question before answering."
+    };
+  }
+
+  if (isWorkLike && isQuestionLike && queryTokens.length <= 1 && wordCount <= 5 && !specificTopic) {
+    return {
+      shouldClarify: true,
+      reason: "underspecified-work-request",
+      guidance:
+        "The user sounds task-focused but did not specify enough detail to answer confidently."
+    };
+  }
+
+  if (wordCount <= 2 && isQuestionLike && !hasContextThread && !specificTopic) {
+    return {
+      shouldClarify: true,
+      reason: "too-brief-without-context",
+      guidance:
+        "The message is too short to infer intent safely, so ask what exactly they mean."
+    };
+  }
+
+  return {
+    shouldClarify: false,
+    reason: "clear-enough",
+    guidance: "The message is specific enough to answer."
+  };
+}
+
+function buildGenericClarifyingReply(userMessage, analysis) {
+  const { normalizedMessage, lowerMessage, messageIntents, topicHint } = analysis;
+
+  if (topicHint) {
+    if (looksTanglishMessage(normalizedMessage)) {
+      return `${topicHint} la enna venum?\nOverview ah, details ah, illa comparison ah?`;
+    }
+
+    return `${topicHint} about what exactly?\nOverview, details, or comparison?`;
+  }
+
+  if (looksTanglishMessage(normalizedMessage)) {
+    if (messageIntents.includes("work") || messageIntents.includes("help")) {
+      return "Seri\nExact-a enna check panna venum?";
+    }
+
+    if (hasKeyword(lowerMessage, ["time", "timing", "today", "tomorrow"])) {
+      return "Seri\nExact timing ah illa full plan ah?";
+    }
+
+    return "Konjam clear-ah sollu\nExact-a enna venum?";
+  }
+
+  if (messageIntents.includes("work") || messageIntents.includes("help")) {
+    return "Sure.\nWhat exactly do you want me to check or help with?";
+  }
+
+  return "Can you be a bit more specific?\nWhat exactly do you want?";
+}
+
+function hasGroundedAnswerContext(retrievedContext, documentContext) {
+  return (
+    toArray(documentContext?.chunks).length > 0 ||
+    toArray(retrievedContext?.knowledge).length > 0 ||
+    toArray(retrievedContext?.memories).length > 0
+  );
+}
+
+function buildInsufficientContextReply(analysis) {
+  if (looksTanglishMessage(analysis.normalizedMessage)) {
+    return "Andha detail context la illa\nSpecific-a send pannu";
+  }
+
+  return "I don't have that detail here.\nSend the exact context and I'll answer.";
+}
+
+function requiresGroundedContextForAnswer(analysis) {
+  const normalized = analysis.lowerMessage;
+
+  return hasKeyword(normalized, [
+    "remember",
+    "what did i",
+    "what i said",
+    "i told",
+    "you said",
+    "we discussed",
+    "our chat",
+    "previous chat",
+    "uploaded",
+    "document",
+    "notes",
+    "context la",
+    "chat la"
+  ]);
+}
+
 export function analyzePersonaReplyNeed(userMessage, recentMessages = []) {
   const normalizedMessage = toText(userMessage);
   const lowerMessage = expandColloquialText(normalizedMessage);
@@ -812,8 +1018,9 @@ export function analyzePersonaReplyNeed(userMessage, recentMessages = []) {
       topicHint,
       guidance: [
         "The user is asking for factual or external-topic information.",
-        "Answer the literal question first using normal world knowledge, while keeping the persona's tone.",
-        "If the question is too broad, ask one short clarifying question instead of inventing specifics."
+        "Use relevant retrieved context when it directly helps.",
+        "If retrieved context is missing or unrelated but the topic is public/general, answer directly using general knowledge in the persona's WhatsApp tone.",
+        "Do not invent personal memories, private facts, or document details."
       ]
     };
   }
@@ -837,17 +1044,14 @@ export function analyzePersonaReplyNeed(userMessage, recentMessages = []) {
 }
 
 export function buildDeterministicPersonaReply(userMessage, recentMessages = []) {
-  const messageNeed = analyzePersonaReplyNeed(userMessage, recentMessages);
+  const analysis = buildPersonaMessageAnalysis(userMessage, recentMessages);
+  const clarity = assessMessageClarity(userMessage, recentMessages, analysis);
 
-  if (messageNeed.responseMode !== "clarify-topic" || !messageNeed.topicHint) {
+  if (!clarity.shouldClarify) {
     return "";
   }
 
-  if (looksTanglishMessage(userMessage)) {
-    return `Theriyum\n${messageNeed.topicHint} la exact-a enna venum? Overview ah, details ah, illa comparison ah?`;
-  }
-
-  return `Yeah, I know about ${messageNeed.topicHint}.\nWhat do you want exactly: an overview, details, or a comparison?`;
+  return buildGenericClarifyingReply(userMessage, analysis);
 }
 
 export function normalizePersonaProfile(rawProfile, resolvedPath = "runtime") {
@@ -1302,12 +1506,16 @@ function scoreExampleMatch(
   return score;
 }
 
-export function retrievePersonaContext(profile, userMessage, maxItems = 6, recentMessages = []) {
-  const messageIntents = inferMessageIntents(userMessage);
-  const queryTokens = buildRetrievalTokens(userMessage, messageIntents);
-  const shortReplyMode = shouldUseShortCasualMode(userMessage, messageIntents, queryTokens);
-  const currentSituation = detectSituationType(userMessage);
-  const conversationState = getConversationState(userMessage, recentMessages);
+export function retrievePersonaContext(
+  profile,
+  userMessage,
+  maxItems = 6,
+  recentMessages = [],
+  analysis = null
+) {
+  const activeAnalysis = analysis ?? buildPersonaMessageAnalysis(userMessage, recentMessages);
+  const { messageIntents, queryTokens, shortReplyMode, currentSituation, conversationState } =
+    activeAnalysis;
   const dominantTraits = getDominantPersonalityTraits(profile);
   const knowledgeMatches = rankItems(profile.knowledgeBase, queryTokens, (item, tokens) => {
     return scoreText(tokens, `${item.title} ${item.content}`) + scoreTags(tokens, item.tags);
@@ -1331,12 +1539,28 @@ export function retrievePersonaContext(profile, userMessage, maxItems = 6, recen
       dominantTraits
     )
   );
+  const minimumKnowledgeScore = 2;
+  const minimumMemoryScore = 2;
+  const minimumSituationScore = 6;
+  const minimumExampleScore = queryTokens.length <= 1 ? 10 : 8;
 
   return {
-    knowledge: knowledgeMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
-    memories: memoryMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
-    situations: situationMatches.slice(0, Math.min(2, maxItems)).map((entry) => entry.item),
-    examples: exampleMatches.slice(0, Math.min(3, maxItems)).map((entry) => entry.item),
+    knowledge: knowledgeMatches
+      .filter((entry) => entry.score >= minimumKnowledgeScore)
+      .slice(0, Math.min(2, maxItems))
+      .map((entry) => entry.item),
+    memories: memoryMatches
+      .filter((entry) => entry.score >= minimumMemoryScore)
+      .slice(0, Math.min(2, maxItems))
+      .map((entry) => entry.item),
+    situations: situationMatches
+      .filter((entry) => entry.score >= minimumSituationScore)
+      .slice(0, Math.min(2, maxItems))
+      .map((entry) => entry.item),
+    examples: exampleMatches
+      .filter((entry) => entry.score >= minimumExampleScore)
+      .slice(0, Math.min(3, maxItems))
+      .map((entry) => entry.item),
     currentSituation,
     currentUserAct: conversationState.currentUserAct,
     lastAssistantAct: conversationState.lastAssistantAct,
@@ -1365,6 +1589,83 @@ function isCompatibleMessageAct(exampleAct, currentAct) {
   return pairs.some(([left, right]) => left === exampleAct && right === currentAct);
 }
 
+function getRecentConversationText(recentMessages = [], userMessage = "", conversationState = {}) {
+  return [
+    ...toArray(recentMessages).map((message) => message?.content),
+    conversationState.lastAssistantMessage,
+    conversationState.lastUserMessage,
+    userMessage
+  ]
+    .map((item) => expandColloquialText(item))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function hasMovieContext(recentMessages = [], userMessage = "", conversationState = {}) {
+  return hasKeyword(getRecentConversationText(recentMessages, userMessage, conversationState), [
+    "movie",
+    "film",
+    "cinema",
+    "padam"
+  ]);
+}
+
+function extractMovieTitle(value) {
+  const normalized = toText(value)
+    .replace(/\b(movie|film|cinema|padam|da|bro|dei|pa)\b/gi, " ")
+    .replace(/[?!]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (/^mr\.?\s*x$/i.test(normalized)) {
+    return "Mr. X";
+  }
+
+  if (countWords(normalized) <= 4 && /[a-z0-9]/i.test(normalized)) {
+    return normalized
+      .split(/\s+/)
+      .map((part) => (/^x$/i.test(part) ? "X" : part.charAt(0).toUpperCase() + part.slice(1)))
+      .join(" ");
+  }
+
+  return "";
+}
+
+function buildContextualShortReply(userMessage, recentMessages, analysis, profile) {
+  const { normalizedMessage, conversationState } = analysis;
+  const personaAbbreviations = profile?.conversationHabits?.abbreviations || [];
+  const okReply = personaAbbreviations.includes("seri") ? "Seri" : "Ok";
+  const movieContext = hasMovieContext(recentMessages, normalizedMessage, conversationState);
+  const movieTitle = extractMovieTitle(normalizedMessage);
+
+  if (movieContext && isAffirmativeReply(normalizedMessage)) {
+    return `${okReply}\nAppo movie polam`;
+  }
+
+  if (
+    movieContext &&
+    analysis.conversationState.currentUserAct === "proposal" &&
+    !movieTitle
+  ) {
+    return "Which movie?";
+  }
+
+  if (
+    movieContext &&
+    movieTitle &&
+    (conversationState.lastAssistantAct === "question" ||
+      conversationState.pendingState === "answering-question")
+  ) {
+    return `${okReply}\n${movieTitle} polam`;
+  }
+
+  return "";
+}
+
 function pickReusableFastPathExample(examples, conversationState, currentSituation) {
   for (const example of toArray(examples)) {
     if (!toText(example?.assistant) || countWords(example.assistant) > 14) {
@@ -1377,10 +1678,11 @@ function pickReusableFastPathExample(examples, conversationState, currentSituati
     const isWorkRelated = exampleText.includes("work") || exampleText.includes("send") || exampleText.includes("code");
     
     // Don't use topic-specific examples unless the conversation is about that topic
-    if (isFoodRelated && !conversationState.lastUserMessage?.toLowerCase().includes("eat|food|saapadu")) {
+    const lastUserMessage = toText(conversationState.lastUserMessage).toLowerCase();
+    if (isFoodRelated && !hasKeyword(lastUserMessage, ["eat", "food", "saapadu"])) {
       continue;
     }
-    if (isWorkRelated && !conversationState.lastUserMessage?.toLowerCase().includes("work|send|code|task")) {
+    if (isWorkRelated && !hasKeyword(lastUserMessage, ["work", "send", "code", "task"])) {
       continue;
     }
 
@@ -1415,12 +1717,26 @@ function pickReusableFastPathExample(examples, conversationState, currentSituati
   return null;
 }
 
-export function buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext, profile) {
-  const normalizedMessage = toText(userMessage);
-  const lowerMessage = expandColloquialText(normalizedMessage);
+export function buildHeuristicPersonaReply(
+  userMessage,
+  recentMessages,
+  retrievedContext,
+  profile,
+  analysis = null
+) {
+  const activeAnalysis = analysis ?? buildPersonaMessageAnalysis(userMessage, recentMessages);
+  const { normalizedMessage, lowerMessage, conversationState, wordCount } = activeAnalysis;
   const timeReference = extractTimeReference(normalizedMessage);
-  const conversationState = getConversationState(userMessage, recentMessages);
-  const wordCount = countWords(normalizedMessage);
+  const contextualShortReply = buildContextualShortReply(
+    userMessage,
+    recentMessages,
+    activeAnalysis,
+    profile
+  );
+
+  if (contextualShortReply) {
+    return contextualShortReply;
+  }
   
   // Use persona's signature phrases and abbreviations if available
   const personaAbbreviations = profile?.conversationHabits?.abbreviations || [];
@@ -1429,7 +1745,6 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
   
   // Get default fallback phrases - prefer persona's actual phrases
   const fallbackAcknowledge = personaAbbreviations[0] || personaAcknowledgements[0] || "Ok";
-  const fallbackQuestion = personaAbbreviations.includes("enna") ? "Enna venum" : "Enna detail?";
   const fallbackCheck = personaSignatures.includes("Naa Podala") ? "Check pannu" : "Check pannu";
   
   // CRITICAL: Don't use heuristic reply for messages expressing intent, need, or desire
@@ -1480,14 +1795,14 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
 
   if (isAffirmativeReply(normalizedMessage)) {
     if (conversationState.lastAssistantAct === "question") {
-      return reusableExample?.assistant || fallbackAcknowledge;
+      return fallbackAcknowledge;
     }
 
     if (conversationState.lastAssistantAct === "proposal") {
-      return reusableExample?.assistant || (personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge);
+      return personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge;
     }
 
-    return reusableExample?.assistant || fallbackAcknowledge;
+    return fallbackAcknowledge;
   }
 
   if (isNegativeReply(normalizedMessage)) {
@@ -1500,10 +1815,10 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
       const negativeFallback = personaAbbreviations.includes("seri") 
         ? "Seri\nLater sollu" 
         : fallbackAcknowledge + "\nLater";
-      return reusableExample?.assistant || negativeFallback;
+      return negativeFallback;
     }
 
-    return reusableExample?.assistant || (personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge);
+    return personaAbbreviations.includes("seri") ? "Seri" : fallbackAcknowledge;
   }
 
   if (isConfirmation) {
@@ -1548,6 +1863,62 @@ export function buildHeuristicPersonaReply(userMessage, recentMessages, retrieve
   }
 
   return reusableExample?.assistant || "";
+}
+
+export function planPersonaReply({
+  profile,
+  userMessage,
+  recentMessages = [],
+  maxContextItems = 6,
+  documentContext = null
+}) {
+  const analysis = buildPersonaMessageAnalysis(userMessage, recentMessages);
+  const clarity = assessMessageClarity(userMessage, recentMessages, analysis);
+  const retrievedContext = retrievePersonaContext(
+    profile,
+    userMessage,
+    maxContextItems,
+    recentMessages,
+    analysis
+  );
+  const lacksGroundedAnswer =
+    analysis.messageNeed.responseMode === "external-knowledge" &&
+    requiresGroundedContextForAnswer(analysis) &&
+    !hasGroundedAnswerContext(retrievedContext, documentContext);
+  const deterministicReply = clarity.shouldClarify
+    ? buildGenericClarifyingReply(userMessage, analysis)
+    : lacksGroundedAnswer
+      ? buildInsufficientContextReply(analysis)
+    : "";
+  const canUseHeuristicReply =
+    profile?.defaults?.enableHeuristicReplies &&
+    !clarity.shouldClarify &&
+    !lacksGroundedAnswer &&
+    analysis.messageNeed.responseMode === "persona-chat" &&
+    (!documentContext || !Array.isArray(documentContext.chunks) || documentContext.chunks.length === 0);
+  const heuristicReply = canUseHeuristicReply
+    ? buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext, profile, analysis)
+    : "";
+  const reply = deterministicReply || heuristicReply;
+
+  return {
+    analysis,
+    clarity,
+    messageNeed: analysis.messageNeed,
+    retrievedContext,
+    deterministicReply,
+    heuristicReply,
+    lacksGroundedAnswer,
+    reply,
+    replyStrategy: clarity.shouldClarify
+      ? "clarify"
+      : lacksGroundedAnswer
+        ? "insufficient-context"
+        : heuristicReply
+          ? "heuristic"
+          : "llm",
+    shouldCallLlm: !reply
+  };
 }
 
 function formatList(items) {
@@ -1733,6 +2104,16 @@ Primary objective:
 - Prefer the exact chat rhythm from the examples over generic polished writing.
 - When appropriate, use the characteristic short replies and signature phrases shown below.
 
+Strict WhatsApp reply contract:
+- Output only the final reply, never analysis, labels, candidate lists, or explanations.
+- Maximum 2 short lines.
+- Privately consider 2-3 possible replies, then send only the best one.
+- If the latest user message is vague or ambiguous, ask one specific clarification question.
+- Use retrieved context only when it directly relates to the latest user message.
+- Ignore unrelated or weakly related retrieved context completely.
+- Do not invent facts, memories, links, times, plans, or document details beyond the grounded context.
+- Sound like a real WhatsApp contact, not an assistant.
+
 Rules:
 ${formatList(profile.behaviorRules)}
 
@@ -1785,14 +2166,16 @@ Reply mode:
 Response guidelines:
 - **PRIORITY 1: Answer the user's literal question first.** Ignore style, just answer what they asked.
 - **PRIORITY 2: Match the persona's speaking style.** Only after the answer is clear, apply the tone.
+- For public/general topics not found in chat examples, answer directly using general knowledge in the same WhatsApp tone.
+- For personal memories, uploaded documents, or previous-chat claims, only answer when grounded context supports it.
 - Never use signature phrases when they make the reply irrelevant or off-topic.
 - If a question is asked, either answer it or ask for clarification. Do not ignore the question.
 - "Mm" is ONLY appropriate for: brief acknowledgements, yes/no after answering something, or when the previous message was already answered.
 - "Mm" is NOT appropriate for: answering questions (like "how are you?"), responding to greetings that expect more, or when the user is asking for information.
-- For greeting messages like "hi" or "hi da", check the conversation flow. If it's a fresh start, ask where they are or what they're up to (like "Naa podala, enga?" or "Enna venum"). If it's a follow-up, "Mm" is fine.
+- For greeting messages like "hi" or "hi da", use only greeting/follow-up wording found in this persona's current extracted evidence. If no greeting evidence fits, keep it simple and ask one natural short question.
 - For questions like "how are you?" or "ena mm", actually respond with relevant content. Use a signature phrase after answering, not instead of.
 - Match the user's language mix and formality when it fits the persona.
-- Default to concise chat-style replies unless the user explicitly asks for depth.
+- Default to concise chat-style replies even when the user asks for depth; keep it within 2 lines.
 - It is okay to use short multi-line messages if that matches the persona examples.
 - For work or planning topics, give a concrete next step instead of vague encouragement.
 - Match the situation, not just shared keywords from examples.
@@ -1802,9 +2185,9 @@ Response guidelines:
 - Everyday personal chat should sound natural and conversational unless the user is clearly asking for something factual or task-focused.
 - When the user sends a brief message (3 words or fewer), consider using a brief acknowledgement or short reply that matches the examples.
 - If the user is asking a simple yes/no question, a one-word or two-word response using the acknowledgement patterns is appropriate ONLY if you've already answered their question.
-- If the reply mode is short casual, answer in 1 to 2 short lines but ensure the answer is clear.
-- If the reply mode is short casual, answer the literal question first and do not add explanation unless needed.
-- If the reply mode is short casual, avoid lectures, summaries, bullet lists, or long paragraphs.
+- Always answer in 1 to 2 short lines and ensure the answer is clear.
+- Answer the literal question first and do not add explanation unless needed.
+- Avoid lectures, summaries, bullet lists, markdown, or long paragraphs.
 - If the user asks about a public topic, brand, company, product, place, or concept, answer that topic directly instead of falling back to a random style sample.
 - If the user is only checking whether you know a topic, confirm briefly and ask what aspect they want.
 - Never answer a factual question with an unrelated catchphrase, tease, or non sequitur. This is not being authentic to the persona; it's being evasive.
@@ -1850,6 +2233,9 @@ function trimReplyLines(lines, maxLines = 2, maxChars = 90) {
     const projectedLength = totalChars === 0 ? compact.length : totalChars + 1 + compact.length;
 
     if (trimmedLines.length >= maxLines || projectedLength > maxChars) {
+      if (trimmedLines.length === 0) {
+        trimmedLines.push(truncateReplyLine(compact, maxChars));
+      }
       break;
     }
 
@@ -1860,22 +2246,40 @@ function trimReplyLines(lines, maxLines = 2, maxChars = 90) {
   return trimmedLines;
 }
 
-export function postProcessPersonaReply(reply, retrievedContext) {
-  const normalizedReply = toText(reply);
+function truncateReplyLine(value, maxChars) {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function removeAssistantStylePhrases(value) {
+  return value
+    .replace(/^(?:final reply|best reply|answer|response)\s*[:\-]\s*/i, "")
+    .replace(/^as an?\s+(?:ai|assistant|language model)[^,.!?]*[,.!?]?\s*/i, "")
+    .replace(/\b(?:according to the retrieved context|based on the provided context)\b[:,]?\s*/gi, "")
+    .trim();
+}
+
+export function postProcessPersonaReply(reply, retrievedContext, options = {}) {
+  const normalizedReply = removeAssistantStylePhrases(toText(reply));
 
   if (!normalizedReply) {
     return normalizedReply;
   }
 
-  if (!retrievedContext?.shortReplyMode) {
-    return normalizedReply;
-  }
-
   const candidateLines = splitIntoReplyLines(normalizedReply);
-  const trimmedLines = trimReplyLines(candidateLines);
+  const maxLines = typeof options.maxLines === "number" ? Math.max(1, options.maxLines) : 2;
+  const shortReplyMaxChars =
+    typeof options.shortReplyMaxChars === "number" ? Math.max(40, options.shortReplyMaxChars) : 120;
+  const normalReplyMaxChars =
+    typeof options.normalReplyMaxChars === "number" ? Math.max(60, options.normalReplyMaxChars) : 180;
+  const maxChars = retrievedContext?.shortReplyMode ? shortReplyMaxChars : normalReplyMaxChars;
+  const trimmedLines = trimReplyLines(candidateLines, maxLines, maxChars);
 
   if (trimmedLines.length === 0) {
-    return normalizedReply;
+    return truncateReplyLine(normalizedReply.replace(/\s+/g, " ").trim(), maxChars);
   }
 
   return trimmedLines.join("\n");

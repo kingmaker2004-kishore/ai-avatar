@@ -409,6 +409,7 @@ export default function App() {
             setMessages([]);
             setResponse("");
             setGroundingItems([]);
+            setConversations([]);
             setInput("");
             setShowConversationList(false);
             window.localStorage.removeItem(CURRENT_CONVERSATION_STORAGE_KEY);

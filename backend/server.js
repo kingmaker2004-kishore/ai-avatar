@@ -5,17 +5,14 @@ import crypto from "node:crypto";
 import cors from "cors";
 import express from "express";
 import {
-  analyzePersonaReplyNeed,
-  buildDeterministicPersonaReply,
-  buildHeuristicPersonaReply,
   buildPersonaPrompt,
   createFallbackPersonaProfile,
   getGroundingSummary,
   loadPersonaProfile,
   normalizePersonaProfile,
+  planPersonaReply,
   postProcessPersonaReply,
   resolveProfilePath,
-  retrievePersonaContext
 } from "./personaEngine.js";
 import { initializeDatabase } from "./db/index.js";
 import {
@@ -29,6 +26,11 @@ import {
   chunkKnowledgeDocument,
   retrieveDocumentContext
 } from "./ragEngine.js";
+import {
+  extractTestCasesFromChat,
+  evaluateSingleTestCase,
+  evaluateRagChatbot
+} from "./ragEvaluator.js";
 
 const backendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -49,16 +51,42 @@ app.use(express.json({ limit: "10mb" }));
 const port = Number(process.env.PORT ?? 5000);
 const liveAvatarApiKey = process.env.LIVEAVATAR_API_KEY ?? process.env.HEYGEN_API_KEY;
 const personaProfilePath = process.env.PERSONA_PROFILE_PATH;
-const personaHistoryTurns = Number(process.env.PERSONA_HISTORY_TURNS ?? 3); // Reduced from 6 to 3 to save tokens
-const personaMaxContextItems = Number(process.env.PERSONA_MAX_CONTEXT_ITEMS ?? 3); // Reduced from 6 to 3
-const personaSharedConversationCount = Number(process.env.PERSONA_SHARED_CONVERSATIONS ?? 1); // Reduced from 3 to 1
-const personaSharedConversationTurns = Number(process.env.PERSONA_SHARED_CONVERSATION_TURNS ?? 2); // Reduced from 4 to 2
-const personaRagMaxChunks = Number(process.env.PERSONA_RAG_MAX_CHUNKS ?? 2); // Reduced from 4 to 2
+const personaHistoryTurns = sanitizeInteger(process.env.PERSONA_HISTORY_TURNS, 5, 1);
+const personaMaxContextItems = sanitizeInteger(process.env.PERSONA_MAX_CONTEXT_ITEMS, 5, 1);
+const personaSharedConversationCount = sanitizeInteger(process.env.PERSONA_SHARED_CONVERSATIONS, 1, 0);
+const personaSharedConversationTurns = sanitizeInteger(process.env.PERSONA_SHARED_CONVERSATION_TURNS, 2, 1);
+const personaRagMaxChunks = sanitizeInteger(process.env.PERSONA_RAG_MAX_CHUNKS, 3, 1);
 const maxTokensPerRequest = sanitizeInteger(process.env.MAX_TOKENS_PER_REQUEST, 10000, 1000);
-const groqResponseTokenReserve = sanitizeInteger(process.env.GROQ_RESPONSE_TOKEN_RESERVE, 1200, 200);
-const maxPromptTokensPerRequest = Math.max(800, maxTokensPerRequest - groqResponseTokenReserve);
+const groqResponseTokenReserve = sanitizeInteger(process.env.GROQ_RESPONSE_TOKEN_RESERVE, 800, 200);
+const modelPromptTokenLimit = Math.max(800, maxTokensPerRequest - groqResponseTokenReserve);
+const groqPromptTokenBudget = sanitizeInteger(process.env.GROQ_PROMPT_TOKEN_BUDGET, 2800, 800);
+const maxPromptTokensPerRequest = Math.min(modelPromptTokenLimit, groqPromptTokenBudget);
+const groqReplyMaxTokens = sanitizeInteger(process.env.GROQ_REPLY_MAX_TOKENS, 120, 32);
+const requestTimeoutMs = sanitizeInteger(process.env.REQUEST_TIMEOUT_MS, 45000, 5000);
+const groqRateLimitRetries = sanitizeInteger(process.env.GROQ_RATE_LIMIT_RETRIES, 1, 0);
+const groqRateLimitMaxWaitMs = sanitizeInteger(process.env.GROQ_RATE_LIMIT_MAX_WAIT_MS, 30000, 0);
 const sessionSecret = process.env.SESSION_SECRET ?? "local-dev-persona-session-secret";
 const userSessionCookieName = "persona_user_session";
+const allowSharedPersonaProfile = process.env.ALLOW_SHARED_PERSONA_PROFILE === "true";
+const persistImportedPersonaProfile = process.env.PERSIST_IMPORTED_PERSONA_PROFILE === "true";
+
+function buildReplyFormattingOptions(replyMaxTokens) {
+  if (replyMaxTokens >= 160) {
+    return {
+      maxLines: 3,
+      shortReplyMaxChars: 180,
+      normalReplyMaxChars: 260
+    };
+  }
+
+  return {
+    maxLines: 2,
+    shortReplyMaxChars: 120,
+    normalReplyMaxChars: 180
+  };
+}
+
+const replyFormattingOptions = buildReplyFormattingOptions(groqReplyMaxTokens);
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) {
@@ -255,7 +283,9 @@ function getUserPersonaState(userId) {
       };
 
       db.updateUserPreferences(userId, upgradedPreferences);
-      writeBasePersonaProfile(upgradedSavedProfile);
+      if (persistImportedPersonaProfile) {
+        writeBasePersonaProfile(upgradedSavedProfile);
+      }
     }
 
     return {
@@ -266,7 +296,9 @@ function getUserPersonaState(userId) {
     };
   }
 
-  const baseProfile = getConfiguredBasePersonaProfile();
+  const baseProfile = allowSharedPersonaProfile
+    ? getConfiguredBasePersonaProfile()
+    : normalizePersonaProfile(createFallbackPersonaProfile(), "user-setup-required");
   const hasConfiguredBaseProfile = !isNeutralFallbackProfile(baseProfile);
 
   if (hasConfiguredBaseProfile) {
@@ -299,7 +331,12 @@ function saveUserPersona(userId, selectedPerson, rawProfile) {
     }
   };
 
-  writeBasePersonaProfile(upgradedProfile);
+  db.archiveUserConversations(userId);
+
+  if (persistImportedPersonaProfile) {
+    writeBasePersonaProfile(upgradedProfile);
+  }
+
   db.updateUserPreferences(userId, nextPreferences);
   return getUserPersonaState(userId);
 }
@@ -308,7 +345,12 @@ function clearUserPersona(userId) {
   const currentProfile = db.getUserProfile(userId);
   const nextPreferences = { ...(currentProfile.preferences ?? {}) };
   delete nextPreferences.persona;
-  writeBasePersonaProfile(createFallbackPersonaProfile());
+  db.archiveUserConversations(userId);
+
+  if (persistImportedPersonaProfile) {
+    writeBasePersonaProfile(createFallbackPersonaProfile());
+  }
+
   db.updateUserPreferences(userId, nextPreferences);
 }
 
@@ -517,6 +559,14 @@ function buildGroundingPayload(retrievedContext, sharedConversationMemories, doc
   };
 }
 
+function selectEvaluationChunks(retrievedContext, documentContext) {
+  if (Array.isArray(documentContext?.chunks) && documentContext.chunks.length > 0) {
+    return documentContext.chunks;
+  }
+
+  return retrievedContext?.knowledge ?? [];
+}
+
 function buildSystemPrompt(
   profile,
   retrievedContext,
@@ -553,6 +603,134 @@ function saveConversationReply(db, userId, conversationId, userMessage, reply) {
   updateConversationTitle(db, userId, conversationId);
 }
 
+/**
+ * Helper to tokenize for evaluation
+ */
+function tokenize(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  const normalized = text.replace(/\r/g, "").replace(/[ \t]+/g, " ").trim().toLowerCase();
+  const RAG_STOP_WORDS = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "in", "is", "it", "of", "on", "or",
+    "that", "the", "this", "to", "was", "what", "when", "where", "which", "who", "why", "with", "you", "your"
+  ]);
+  const tokens = normalized
+    .split(/[^a-z0-9]+/i)
+    .filter((token) => token.length > 2 && !RAG_STOP_WORDS.has(token));
+  return [...new Set(tokens)];
+}
+
+function scoreMemoryText(queryTokens, value) {
+  const normalized = compactWhitespace(value).toLowerCase();
+
+  if (!normalized) {
+    return 0;
+  }
+
+  return queryTokens.reduce((score, token) => score + (normalized.includes(token) ? 1 : 0), 0);
+}
+
+function filterConversationMemoriesForMessage(memories, userMessage) {
+  if (!Array.isArray(memories) || memories.length === 0) {
+    return [];
+  }
+
+  const queryTokens = tokenize(userMessage);
+
+  if (queryTokens.length === 0) {
+    return [];
+  }
+
+  return memories
+    .map((conversation) => {
+      const messageScore = (conversation.messages ?? []).reduce(
+        (score, message) => score + scoreMemoryText(queryTokens, message.content),
+        0
+      );
+      const titleScore = scoreMemoryText(queryTokens, conversation.title) * 2;
+
+      return {
+        conversation,
+        score: titleScore + messageScore
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .map((entry) => entry.conversation);
+}
+
+/**
+ * Evaluate a single chat exchange in real-time
+ */
+function evaluateChatExchange(userMessage, reply, retrievedChunks, previousMessages) {
+  try {
+    // Quick relevancy check: Does reply address the user's message?
+    const messageTokens = new Set(tokenize(userMessage));
+    const replyTokens = new Set(tokenize(reply));
+    const overlapCount = [...messageTokens].filter(t => replyTokens.has(t)).length;
+    const relevancyScore = messageTokens.size > 0 ? Math.min(1, overlapCount / Math.max(messageTokens.size, 1)) : 0.5;
+
+    // Token overlap similarity
+    const intersection = [...messageTokens].filter(t => replyTokens.has(t)).length;
+    const union = new Set([...messageTokens, ...replyTokens]).size;
+    const tokenOverlap = union > 0 ? intersection / union : 0;
+
+    // Fluency check
+    const tokens = tokenize(reply);
+    const sentences = reply.split(/[.!?]+/).filter(s => s.trim().length > 0);
+    const lengthScore = Math.min(1, tokens.length / 20);
+    const sentenceScore = sentences.length > 0 ? Math.min(1, sentences.length / 3) : 0;
+    const hasPunctuation = /[.!?]/.test(reply) ? 1 : 0;
+    const fluencyScore = (lengthScore * 0.4 + sentenceScore * 0.3 + hasPunctuation * 0.3);
+
+    // Retrieval quality
+    const retrievalScore = retrievedChunks.length > 0 ? Math.min(1, retrievedChunks.length / 4) : 0;
+
+    // Context retention (if there are previous messages)
+    let retentionScore = 0.5;
+    if (previousMessages && previousMessages.length > 0) {
+      const previousContent = previousMessages.map(m => m.content || "").join(" ");
+      const previousTokens = new Set(tokenize(previousContent));
+      const retainedTokens = [...previousTokens].filter(t => replyTokens.has(t) && t.length > 3).length;
+      retentionScore = Math.min(1, retainedTokens / Math.max(previousTokens.size, 1));
+    }
+
+    // Role adherence (WhatsApp style: short, casual)
+    const isShort = tokens.length < 30 ? 1 : 0.7;
+    const hasCasual = /\b(ok|yeah|lol|cool|sure|got it|thanks)\b/i.test(reply) ? 1 : 0.7;
+    const noFormal = /\b(therefore|furthermore|regarding)\b/i.test(reply) ? 0.3 : 1;
+    const roleScore = (isShort * 0.3 + hasCasual * 0.4 + noFormal * 0.3);
+
+    // Calculate weighted scores (1-5 scale)
+    const relevancyOut5 = Math.round(relevancyScore * 5 * 10) / 10;
+    const semanticOut5 = Math.round(((tokenOverlap * 0.4 + fluencyScore * 0.6) * 5) * 10) / 10;
+    const retrievalOut5 = Math.round((retrievalScore * 5) * 10) / 10;
+    const retentionOut5 = Math.round((retentionScore * 5) * 10) / 10;
+    const roleOut5 = Math.round((roleScore * 5) * 10) / 10;
+
+    const overallScore = Math.round(
+      ((relevancyOut5 + semanticOut5 + retrievalOut5 + retentionOut5 + roleOut5) / 5) * 10
+    ) / 10;
+
+    return {
+      overall: Math.min(5, Math.max(1, overallScore)),
+      relevancy: Math.min(5, Math.max(1, relevancyOut5)),
+      semantic: Math.min(5, Math.max(1, semanticOut5)),
+      retrieval: Math.min(5, Math.max(1, retrievalOut5)),
+      retention: Math.min(5, Math.max(1, retentionOut5)),
+      roleAdherence: Math.min(5, Math.max(1, roleOut5)),
+      details: {
+        tokenOverlapSimilarity: parseFloat((tokenOverlap * 100).toFixed(1)) + "%",
+        fluency: parseFloat((fluencyScore * 100).toFixed(1)) + "%",
+        retrievedChunkCount: retrievedChunks.length,
+        quality: overallScore >= 4 ? "Excellent ✅" : overallScore >= 3 ? "Good ⭐" : overallScore >= 2 ? "Fair ⚠️" : "Poor ❌"
+      }
+    };
+  } catch (error) {
+    console.warn("Error evaluating chat exchange:", error);
+    return null; // Non-critical, don't fail chat if evaluation errors
+  }
+}
+
 function buildChatSuccessResponse({
   reply,
   conversationId,
@@ -560,14 +738,16 @@ function buildChatSuccessResponse({
   profile,
   retrievedContext,
   sharedConversationMemories,
-  documentContext
+  documentContext,
+  evaluation
 }) {
   return {
     reply,
     conversationId,
     userId,
     personaName: profile.person.name,
-    grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories, documentContext)
+    grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories, documentContext),
+    evaluation // Include real-time evaluation scores
   };
 }
 
@@ -729,8 +909,12 @@ Rules:
 - Answer the user's literal question first.
 - Stay in character and keep claims grounded.
 - Match the user's language mix when it fits the persona.
-- Be concise unless the user explicitly asks for detail.
-- If unsure, say so naturally instead of inventing facts or memories.
+- Output only the final WhatsApp reply, with no labels or analysis.
+- Keep it to 1-2 short lines.
+- Use retrieved context only when it directly matches the latest user message.
+- Ignore unrelated context.
+- For public/general topics outside the chat, answer directly using general knowledge in the same WhatsApp tone.
+- For personal memories, uploaded documents, or previous-chat claims, say so naturally if unsupported instead of inventing.
 
 Latest message handling:
 - Response mode: ${messageNeed?.responseMode || "persona-chat"}
@@ -916,6 +1100,32 @@ function errorDetailsContainTokenLimit(details) {
   );
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractRetryAfterMs(response, errorData) {
+  const retryAfterHeader = response.headers.get("retry-after");
+  const retryAfterSeconds = Number(retryAfterHeader);
+
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(groqRateLimitMaxWaitMs, Math.ceil(retryAfterSeconds * 1000));
+  }
+
+  const message =
+    typeof errorData === "string"
+      ? errorData
+      : errorData?.error?.message ?? JSON.stringify(errorData ?? "");
+  const match = message.match(/try again in\s+([\d.]+)s/i);
+  const parsedSeconds = Number(match?.[1]);
+
+  if (Number.isFinite(parsedSeconds) && parsedSeconds > 0) {
+    return Math.min(groqRateLimitMaxWaitMs, Math.ceil(parsedSeconds * 1000));
+  }
+
+  return Math.min(groqRateLimitMaxWaitMs, 5000);
+}
+
 async function parseError(response) {
   const rawText = await response.text();
 
@@ -923,6 +1133,31 @@ async function parseError(response) {
     return JSON.parse(rawText);
   } catch {
     return rawText;
+  }
+}
+
+async function fetchGroqChatCompletion(messages, profile) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+
+  try {
+    return await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
+        messages,
+        temperature: profile.defaults.temperature ?? 0.7,
+        max_tokens: groqReplyMaxTokens,
+        stream: false
+      }),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1016,6 +1251,78 @@ app.post("/api/persona/configure-whatsapp", async (req, res) => {
   } catch (error) {
     return res.status(400).json({
       error: error instanceof Error ? error.message : "Unable to create a persona from that chat."
+    });
+  }
+});
+
+app.post("/api/persona/evaluate-whatsapp", async (req, res) => {
+  const userId = getUserId(req, res);
+  const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
+  const messages = parseWhatsAppChat(chatText);
+
+  if (messages.length === 0) {
+    return res.status(400).json({
+      error: "Could not find WhatsApp messages in that text file."
+    });
+  }
+
+  try {
+    const personaState = getUserPersonaState(userId);
+    if (!personaState.isConfigured) {
+      return res.status(400).json({
+        error: "Persona must be configured before evaluation."
+      });
+    }
+
+    // Extract test cases from the chat
+    const testCases = extractTestCasesFromChat(messages);
+
+    if (testCases.length === 0) {
+      return res.status(400).json({
+        error: "No conversation pairs found for evaluation."
+      });
+    }
+
+    // Run evaluation on a sample of test cases (limit to 5 for performance)
+    const sampleSize = Math.min(5, testCases.length);
+    const evaluationResults = [];
+
+    for (let i = 0; i < sampleSize; i++) {
+      const testCase = testCases[i];
+
+      // For now, we simulate retrieving chunks and generating replies
+      // In production, this would call the actual RAG + LLM pipeline
+      const retrievedChunks = []; // Would be populated by RAG retrieval
+      const generatedReply = testCase.groundTruthReply; // Placeholder - would be LLM-generated
+
+      const result = evaluateSingleTestCase(
+        testCase,
+        retrievedChunks,
+        generatedReply,
+        [] // allAvailableChunks
+      );
+
+      evaluationResults.push(result);
+    }
+
+    // Generate summary evaluation
+    const { summary, detailedResults } = evaluateRagChatbot(evaluationResults);
+
+    return res.json({
+      userId,
+      evaluation: {
+        personaName: personaState.selectedPerson,
+        totalMessagesAnalyzed: messages.length,
+        testCasesGenerated: testCases.length,
+        testCasesEvaluated: evaluationResults.length,
+        summary,
+        detailedResults: detailedResults.slice(0, 3) // Return top 3 for brevity
+      }
+    });
+  } catch (error) {
+    console.error("Error evaluating RAG chatbot:", error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to evaluate RAG chatbot."
     });
   }
 });
@@ -1285,40 +1592,48 @@ app.post("/api/chat", async (req, res) => {
 
     // Get recent message history from database
     const recentMessages = db.getRecentMessages(convId, personaHistoryTurns);
-    const sharedConversationMemories = db.getRecentConversationMemories(
-      userId,
-      convId,
-      personaSharedConversationCount,
-      personaSharedConversationTurns
+    const sharedConversationMemories = filterConversationMemoriesForMessage(
+      db.getRecentConversationMemories(
+        userId,
+        convId,
+        personaSharedConversationCount,
+        personaSharedConversationTurns
+      ),
+      userMessage
     );
 
     const personaState = getUserPersonaState(userId);
     const profile = personaState.profile;
-    const retrievedContext = retrievePersonaContext(
-      profile,
-      userMessage,
-      personaMaxContextItems,
-      recentMessages
-    );
     const documentContext = retrieveDocumentContext(
       userMessage,
       recentMessages,
       db.getKnowledgeChunks(userId),
       personaRagMaxChunks
     );
-    const messageNeed = analyzePersonaReplyNeed(userMessage, recentMessages);
-    const deterministicReply = buildDeterministicPersonaReply(userMessage, recentMessages);
-    const canUseHeuristicReply =
-      profile.defaults.enableHeuristicReplies &&
-      documentContext.chunks.length === 0 &&
-      messageNeed.responseMode === "persona-chat";
-    const heuristicReply = canUseHeuristicReply
-      ? buildHeuristicPersonaReply(userMessage, recentMessages, retrievedContext, profile)
-      : "";
+    const replyPlan = planPersonaReply({
+      profile,
+      userMessage,
+      recentMessages,
+      maxContextItems: personaMaxContextItems,
+      documentContext
+    });
+    const { messageNeed, retrievedContext, reply: plannedReply } = replyPlan;
 
-    if (deterministicReply || heuristicReply) {
-      const finalReply = deterministicReply || heuristicReply;
+    if (plannedReply) {
+      const finalReply = postProcessPersonaReply(
+        plannedReply,
+        retrievedContext,
+        replyFormattingOptions
+      );
       saveConversationReply(db, userId, convId, userMessage, finalReply);
+
+      // Evaluate the exchange in real-time
+      const evaluation = evaluateChatExchange(
+        userMessage,
+        finalReply,
+        selectEvaluationChunks(retrievedContext, documentContext),
+        recentMessages
+      );
 
       return res.json(
         buildChatSuccessResponse({
@@ -1328,12 +1643,13 @@ app.post("/api/chat", async (req, res) => {
           profile,
           retrievedContext,
           sharedConversationMemories,
-          documentContext
+          documentContext,
+          evaluation
         })
       );
     }
 
-    const groqRequestContext = buildGroqRequestContext({
+    let groqRequestContext = buildGroqRequestContext({
       profile,
       retrievedContext,
       messageNeed,
@@ -1343,7 +1659,7 @@ app.post("/api/chat", async (req, res) => {
       userMessage,
       maxPromptTokens: maxPromptTokensPerRequest
     });
-    const {
+    let {
       messages,
       retrievedContext: effectiveRetrievedContext,
       sharedConversationMemories: effectiveSharedConversationMemories,
@@ -1370,40 +1686,60 @@ app.post("/api/chat", async (req, res) => {
       );
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-
     let response;
-    try {
-      response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
-          messages,
-          temperature: profile.defaults.temperature ?? 0.7,
-          stream: false
-        }),
-        signal: controller.signal
-      });
-    } catch (fetchError) {
-      clearTimeout(timeout);
-      if (fetchError.name === "AbortError") {
-        console.error("Groq request timeout after 30 seconds");
-        return res.status(504).json({
-          error: "Groq request timeout. Please try again."
+    for (let attempt = 0; attempt <= groqRateLimitRetries; attempt += 1) {
+      try {
+        response = await fetchGroqChatCompletion(messages, profile);
+      } catch (fetchError) {
+        if (fetchError.name === "AbortError") {
+          console.error(`Groq request timeout after ${requestTimeoutMs}ms`);
+          return res.status(504).json({
+            error: "Groq request timeout. Please try again."
+          });
+        }
+
+        console.error("Groq fetch error:", fetchError.message);
+        return res.status(503).json({
+          error: "Unable to reach Groq. Check your internet connection.",
+          details: fetchError.message
         });
       }
-      console.error("Groq fetch error:", fetchError.message);
-      return res.status(503).json({
-        error: "Unable to reach Groq. Check your internet connection.",
-        details: fetchError.message
+
+      if (response.status !== 429 || attempt >= groqRateLimitRetries) {
+        break;
+      }
+
+      const rateLimitError = await parseError(response);
+      const waitMs = extractRetryAfterMs(response, rateLimitError);
+      console.warn(
+        `Groq rate limit hit. Retrying in ${Math.round(waitMs / 1000)}s with minimal prompt.`
+      );
+
+      await sleep(waitMs);
+
+      groqRequestContext = buildGroqRequestContext({
+        profile,
+        retrievedContext,
+        messageNeed,
+        sharedConversationMemories,
+        documentContext,
+        recentMessages,
+        userMessage,
+        maxPromptTokens: maxPromptTokensPerRequest,
+        forceMinimal: true
       });
-    } finally {
-      clearTimeout(timeout);
+      ({
+        messages,
+        retrievedContext: effectiveRetrievedContext,
+        sharedConversationMemories: effectiveSharedConversationMemories,
+        documentContext: effectiveDocumentContext,
+        estimatedTokens,
+        mode: groqPromptMode
+      } = groqRequestContext);
+
+      console.log(
+        `Retry prompt tokens: ${estimatedTokens} / ${maxPromptTokensPerRequest} (${groqPromptMode})`
+      );
     }
 
     if (!response.ok) {
@@ -1446,7 +1782,11 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const reply = postProcessPersonaReply(rawReply, effectiveRetrievedContext);
+    const reply = postProcessPersonaReply(
+      rawReply,
+      effectiveRetrievedContext,
+      replyFormattingOptions
+    );
 
     if (!reply) {
       console.error("Post-processing resulted in empty reply:", rawReply);
@@ -1457,6 +1797,14 @@ app.post("/api/chat", async (req, res) => {
 
     saveConversationReply(db, userId, convId, userMessage, reply);
 
+    // Evaluate the exchange in real-time
+    const evaluation = evaluateChatExchange(
+      userMessage,
+      reply,
+      selectEvaluationChunks(effectiveRetrievedContext, effectiveDocumentContext),
+      recentMessages
+    );
+
     return res.json(
         buildChatSuccessResponse({
           reply,
@@ -1465,7 +1813,8 @@ app.post("/api/chat", async (req, res) => {
           profile,
           retrievedContext: effectiveRetrievedContext,
           sharedConversationMemories: effectiveSharedConversationMemories,
-          documentContext: effectiveDocumentContext
+          documentContext: effectiveDocumentContext,
+          evaluation
         })
       );
   } catch (error) {

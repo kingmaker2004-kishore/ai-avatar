@@ -1873,7 +1873,11 @@ function selectPersonaExtractionRequest(baseProfile, systemPrompt) {
     1000
   );
   const responseTokenReserve = sanitizeInteger(process.env.GROQ_RESPONSE_TOKEN_RESERVE, 1200, 200);
-  const maxPromptTokens = Math.max(1000, maxTokensPerRequest - responseTokenReserve);
+  const personaPromptBudget = sanitizeInteger(process.env.GROQ_PERSONA_PROMPT_TOKEN_BUDGET, 4200, 1000);
+  const maxPromptTokens = Math.min(
+    Math.max(1000, maxTokensPerRequest - responseTokenReserve),
+    personaPromptBudget
+  );
   const variants = [
     { mode: "full", limits: {} },
     {
@@ -2173,6 +2177,7 @@ async function extractPersonaMetadataWithGroq(baseProfile, options = {}) {
   }
 
   const model = toText(options.model, "llama-3.3-70b-versatile");
+  const maxResponseTokens = sanitizeInteger(process.env.GROQ_PERSONA_REPLY_MAX_TOKENS, 900, 200);
   const systemPrompt = `
 You are an expert analyst of WhatsApp chat behavior.
 Your job is to refine a persona profile from chat evidence without inventing unsupported backstory.
@@ -2200,6 +2205,7 @@ Important constraints:
     body: JSON.stringify({
       model,
       temperature: 0.2,
+      max_tokens: maxResponseTokens,
       stream: false,
       messages: extractionRequest.messages
     })

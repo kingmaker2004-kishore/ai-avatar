@@ -165,6 +165,18 @@ function scoreChunkMatch(queryTokens, normalizedQuery, chunk) {
   return score;
 }
 
+function getMinimumChunkScore(queryTokens, normalizedQuery) {
+  if (queryTokens.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (normalizedQuery.length >= 16) {
+    return 6;
+  }
+
+  return queryTokens.length <= 1 ? 6 : 5;
+}
+
 export function chunkKnowledgeDocument(content) {
   const normalizedContent = content.replace(/\u0000/g, "").trim();
   const paragraphs = splitParagraphs(normalizedContent);
@@ -186,12 +198,13 @@ export function retrieveDocumentContext(userMessage, recentMessages = [], stored
   const enrichedQuery = [userMessage, ...recentUserMessages].filter(Boolean).join(" ");
   const queryTokens = tokenize(enrichedQuery);
   const normalizedQuery = normalizeForSearch(userMessage);
+  const minimumScore = getMinimumChunkScore(queryTokens, normalizedQuery);
   const rankedChunks = storedChunks
     .map((chunk) => ({
       chunk,
       score: scoreChunkMatch(queryTokens, normalizedQuery, chunk)
     }))
-    .filter((entry) => entry.score > 0)
+    .filter((entry) => entry.score >= minimumScore)
     .sort((left, right) => right.score - left.score);
 
   const selectedChunks = [];
@@ -226,7 +239,9 @@ export function retrieveDocumentContext(userMessage, recentMessages = [], stored
   return {
     queryTokens,
     chunks: selectedChunks,
-    documentTitles: unique(selectedChunks.map((chunk) => chunk.title))
+    documentTitles: unique(selectedChunks.map((chunk) => chunk.title)),
+    minimumScore,
+    hasRelevantContext: selectedChunks.length > 0
   };
 }
 
@@ -244,9 +259,10 @@ export function buildDocumentContextPrompt(documentContext) {
 
   return `
 Reference documents uploaded by the user:
-- Use these chunks when the user asks about project details, notes, specs, docs, code snippets, or factual material contained in uploaded files.
-- Prefer these chunks over generic assumptions when they directly answer the question.
-- If the chunks are only partial, answer with what is supported and say what is missing.
+- Use only chunks that directly answer the latest user message.
+- Ignore any chunk that is weakly related, off-topic, or only shares generic words.
+- Prefer these chunks over assumptions when they are relevant.
+- If the chunks do not support an answer, say you do not have that detail instead of guessing.
 
 Retrieved document chunks:
 ${formattedChunks}
