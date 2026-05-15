@@ -1505,3 +1505,59 @@ body,
   border-color: var(--mono-border-strong);
   transform: none;
 }
+
+/* ===== FULL-WIDTH PERSONA PAGES ===== */
+.persona-library-shell {
+  width: 100%;
+  min-height: 100vh;
+  grid-template-columns: 1fr;
+  border-radius: 0;
+  border: none;
+}
+
+.persona-library-main {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.library-topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.library-search {
+  display: block;
+  margin-top: 12px;
+}
+
+.library-search input {
+  margin-top: 0;
+}
+
+.saved-persona-list {
+  margin-top: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+}
+
+.saved-persona-card {
+  min-height: 180px;
+  align-content: start;
+}
+
+@media (max-width: 900px) {
+  .persona-library-main {
+    padding: 16px;
+  }
+
+  .library-topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .saved-persona-list {
+    grid-template-columns: 1fr;
+  }
+}

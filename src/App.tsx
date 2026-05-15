@@ -1,13 +1,12 @@
 import { lazy, memo, Suspense, useEffect, useRef, useState } from "react";
-import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   API_BASE_URL,
   fetchApi,
   type BootstrapResponse,
   type Conversation,
-  type KnowledgeDocument,
-  type SavedPersona,
   type PersonaSummary,
+  type SavedPersona,
   type StoredMessage
 } from "./api";
 import PersonaSetup from "./PersonaSetup";
@@ -30,18 +29,6 @@ function toChatMessages(messages: StoredMessage[]) {
     role: message.role as "user" | "assistant",
     text: message.content
   }));
-}
-
-function applyPersonaDetails(
-  persona: PersonaSummary,
-  setPersonaName: (value: string) => void,
-  setPersonaSummary: (value: string) => void
-) {
-  setPersonaName(persona.name || "Persona Avatar");
-  setPersonaSummary(
-    persona.summary ||
-      "Grounded in the current chat, earlier chats, memory videos, and a structured knowledge base."
-  );
 }
 
 function getConversationStorageKey(personaId: string) {
@@ -71,50 +58,11 @@ function getPersonaInitials(name: string) {
   return `${words[0][0] ?? ""}${words[1][0] ?? ""}`.toUpperCase();
 }
 
-export default function App() {
-  return (
-    <AuthProvider>
-      <BrowserRouter>
-        <AppContent />
-      </BrowserRouter>
-    </AuthProvider>
-  );
-}
-
-function AppContent() {
-  const { isLoggedIn, logout, isSessionLoading } = useAuth();
-  const location = useLocation();
-
-  if (isSessionLoading) {
-    return (
-      <main className="app-shell">
-        <section className="panel setup-panel route-fade">
-          <div className="hero-copy">
-            <p className="eyebrow">Persona Session</p>
-            <h1>Restoring Session</h1>
-            <p className="subtitle">Checking your saved login and workspace.</p>
-          </div>
-        </section>
-      </main>
-    );
-  }
-
-  return (
-    <div className="route-fade" key={location.pathname}>
-      <Routes location={location}>
-        <Route path="/login" element={isLoggedIn ? <Navigate to="/" replace /> : <Login />} />
-        <Route path="/*" element={isLoggedIn ? <ChatApp logout={logout} /> : <Navigate to="/login" replace />} />
-      </Routes>
-    </div>
-  );
-}
-
 function formatCompactTimestamp(value: string) {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) {
     return "Recent";
   }
-
   const diffMinutes = Math.max(1, Math.floor((Date.now() - timestamp) / (1000 * 60)));
   if (diffMinutes < 60) {
     return `${diffMinutes}m`;
@@ -147,7 +95,155 @@ const ChatMessageRow = memo(function ChatMessageRow({
   );
 });
 
-function ChatApp({ logout }: { logout: () => Promise<void> }) {
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <AppContent />
+      </BrowserRouter>
+    </AuthProvider>
+  );
+}
+
+function AppContent() {
+  const { isLoggedIn, isSessionLoading } = useAuth();
+  const location = useLocation();
+
+  if (isSessionLoading) {
+    return (
+      <main className="app-shell">
+        <section className="panel setup-panel route-fade">
+          <div className="hero-copy">
+            <p className="eyebrow">Persona Session</p>
+            <h1>Restoring Session</h1>
+            <p className="subtitle">Checking your saved login and workspace.</p>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <div className="route-fade" key={location.pathname}>
+      <Routes location={location}>
+        <Route path="/login" element={isLoggedIn ? <Navigate to="/personas" replace /> : <Login />} />
+        <Route path="/personas" element={isLoggedIn ? <SavedPersonasPage /> : <Navigate to="/login" replace />} />
+        <Route path="/persona/new" element={isLoggedIn ? <NewPersonaPage /> : <Navigate to="/login" replace />} />
+        <Route path="/chat/:personaId" element={isLoggedIn ? <ChatPage /> : <Navigate to="/login" replace />} />
+        <Route path="/" element={<Navigate to={isLoggedIn ? "/personas" : "/login"} replace />} />
+        <Route path="*" element={<Navigate to={isLoggedIn ? "/personas" : "/login"} replace />} />
+      </Routes>
+    </div>
+  );
+}
+
+function SavedPersonasPage() {
+  const navigate = useNavigate();
+  const [personas, setPersonas] = useState<SavedPersona[]>([]);
+  const [search, setSearch] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      try {
+        const { response, data } = await fetchApi("/api/persona/bootstrap");
+        if (!response.ok || !mounted) {
+          return;
+        }
+        const bootstrap = data as BootstrapResponse;
+        setPersonas(bootstrap.personas ?? []);
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : "Unable to load personas.");
+        }
+      } finally {
+        if (mounted) {
+          setIsLoading(false);
+        }
+      }
+    };
+    void load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const openPersona = async (personaId: string) => {
+    const { response, data } = await fetchApi("/api/persona/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ personaId })
+    });
+    if (!response.ok) {
+      throw new Error(data.error ?? "Unable to open persona.");
+    }
+    navigate(`/chat/${personaId}`);
+  };
+
+  const filtered = personas.filter((persona) => {
+    const q = search.trim().toLowerCase();
+    if (!q) {
+      return true;
+    }
+    return `${persona.name} ${persona.preview} ${persona.summary}`.toLowerCase().includes(q);
+  });
+
+  return (
+    <main className="persona-library-shell">
+      <section className="persona-library-main">
+        <div className="library-topbar">
+          <h1>Saved Personas</h1>
+          <button className="primary-action" onClick={() => navigate("/persona/new")}>
+            New Persona
+          </button>
+        </div>
+        <label className="library-search">
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search personas" />
+        </label>
+        <div className="saved-persona-list">
+          {isLoading ? <p className="empty-library-copy">Loading personas...</p> : null}
+          {!isLoading && filtered.length === 0 ? <p className="empty-library-copy">No saved personas yet.</p> : null}
+          {filtered.map((persona) => (
+            <button key={persona.id} className="saved-persona-card" onClick={() => void openPersona(persona.id)}>
+              <div className="saved-persona-avatar">{persona.avatarInitials || "PA"}</div>
+              <div className="saved-persona-copy">
+                <strong>{persona.name}</strong>
+                <span>Last active: {formatCompactTimestamp(persona.lastActive)}</span>
+                <p>{persona.chatCount} chats · Uploaded {formatCompactTimestamp(persona.createdAt)}</p>
+                <small>{persona.preview || persona.summary}</small>
+              </div>
+            </button>
+          ))}
+        </div>
+        {error ? <p className="message error">{error}</p> : null}
+      </section>
+    </main>
+  );
+}
+
+function NewPersonaPage() {
+  const navigate = useNavigate();
+  const [error, setError] = useState("");
+  return (
+    <main className="app-shell">
+      <PersonaSetup
+        compactOnly
+        onError={setError}
+        onReady={(persona) => {
+          navigate(`/chat/${persona.id}`);
+        }}
+      />
+      {error ? <p className="message error">{error}</p> : null}
+    </main>
+  );
+}
+
+function ChatPage() {
+  const { personaId = "" } = useParams();
+  const navigate = useNavigate();
+  const { logout } = useAuth();
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -155,201 +251,148 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
   const [isLoading, setIsLoading] = useState(false);
   const [playbackRequest, setPlaybackRequest] = useState(0);
   const [personaName, setPersonaName] = useState("Persona Avatar");
-  const [personaSummary, setPersonaSummary] = useState(
-    "Grounded in the current chat, earlier chats, memory videos, and a structured knowledge base."
-  );
+  const [personaSummary, setPersonaSummary] = useState("");
   const [activePersonaId, setActivePersonaId] = useState("");
+  const [savedPersonas, setSavedPersonas] = useState<SavedPersona[]>([]);
   const [groundingItems, setGroundingItems] = useState<string[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [savedPersonas, setSavedPersonas] = useState<SavedPersona[]>([]);
-  const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
-  const [knowledgeFile, setKnowledgeFile] = useState<File | null>(null);
-  const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
-  const [showConversationList, setShowConversationList] = useState(false);
+  const [showConversationList, setShowConversationList] = useState(true);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
   const [isBootstrapLoading, setIsBootstrapLoading] = useState(true);
-  const [isPersonaReady, setIsPersonaReady] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
-  const knowledgeFileInputRef = useRef<HTMLInputElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const personaInitials = getPersonaInitials(personaName);
 
-  async function loadConversations() {
-    const { response, data } = await fetchApi("/api/conversations");
-
-    if (!response.ok) {
-      throw new Error(data.error ?? "Failed to load conversations");
-    }
-
-    const nextConversations = (data.conversations ?? []) as Conversation[];
-    setConversations(nextConversations);
-    return nextConversations;
-  }
-
-  async function loadKnowledgeDocuments() {
-    const { response, data } = await fetchApi("/api/rag/documents");
-
-    if (!response.ok) {
-      throw new Error(data.error ?? "Failed to load knowledge documents");
-    }
-
-    setKnowledgeDocuments((data.documents ?? []) as KnowledgeDocument[]);
-  }
-
-  async function loadCurrentConversation(activeConversationId: string) {
-    const { response, data } = await fetchApi(`/api/conversations/${activeConversationId}`);
-
-    if (response.status === 404) {
-      if (activePersonaId) {
-        window.localStorage.removeItem(getConversationStorageKey(activePersonaId));
-      }
-      setConversationId(null);
-      setMessages([]);
-      return;
-    }
-
-    if (!response.ok) {
-      throw new Error(data.error ?? "Failed to load conversation");
-    }
-
-    setMessages(toChatMessages((data.messages ?? []) as StoredMessage[]));
-  }
-
-  async function persistSessionState(nextState: {
+  const persistSessionState = async (nextState: {
     currentPersonaId?: string;
     currentConversationId?: string | null;
     sidebarHistoryOpen?: boolean;
-  }) {
+  }) => {
     try {
       await fetchApi("/api/session/state", {
         method: "PUT",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(nextState)
       });
-    } catch (err) {
-      console.warn("Unable to persist session state:", err);
+    } catch {
+      // no-op
     }
-  }
+  };
+
+  const loadConversations = async () => {
+    const { response, data } = await fetchApi("/api/conversations");
+    if (!response.ok) {
+      throw new Error(data.error ?? "Failed to load conversations");
+    }
+    const nextConversations = (data.conversations ?? []) as Conversation[];
+    setConversations(nextConversations);
+    return nextConversations;
+  };
+
+  const loadCurrentConversation = async (id: string) => {
+    const { response, data } = await fetchApi(`/api/conversations/${id}`);
+    if (!response.ok) {
+      throw new Error(data.error ?? "Failed to load conversation");
+    }
+    setMessages(toChatMessages((data.messages ?? []) as StoredMessage[]));
+  };
 
   useEffect(() => {
-    let isMounted = true;
-
-    const loadBootstrap = async () => {
+    let mounted = true;
+    const bootstrap = async () => {
       try {
         const { response, data } = await fetchApi("/api/persona/bootstrap");
-
-        if (!response.ok || !isMounted) {
+        if (!response.ok || !mounted) {
           return;
         }
-
-        const bootstrap = data as BootstrapResponse;
-        applyPersonaDetails(bootstrap.persona, setPersonaName, setPersonaSummary);
-        setSavedPersonas(bootstrap.personas ?? []);
-        setActivePersonaId(bootstrap.currentPersonaId ?? bootstrap.persona.id ?? "");
-        setConversationId(bootstrap.lastConversationId ?? null);
-        setShowConversationList(Boolean(bootstrap.sidebarHistoryOpen));
-        setIsPersonaReady(!bootstrap.requiresSetup);
+        const bootstrapData = data as BootstrapResponse;
+        setSavedPersonas(bootstrapData.personas ?? []);
+        if (!personaId) {
+          navigate("/personas", { replace: true });
+          return;
+        }
+        const selectRes = await fetchApi("/api/persona/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ personaId })
+        });
+        if (!selectRes.response.ok) {
+          navigate("/personas", { replace: true });
+          return;
+        }
+        const persona = selectRes.data.persona as PersonaSummary;
+        setPersonaName(persona.name);
+        setPersonaSummary(persona.summary);
+        setActivePersonaId(persona.id);
       } catch (err) {
-        console.warn("Unable to load bootstrap state:", err);
-        setError(err instanceof Error ? err.message : "Unable to load persona setup.");
+        if (mounted) {
+          setError(err instanceof Error ? err.message : "Unable to open persona.");
+        }
       } finally {
-        if (isMounted) {
+        if (mounted) {
           setIsBootstrapLoading(false);
         }
       }
     };
-
-    void loadBootstrap();
-
+    void bootstrap();
     return () => {
-      isMounted = false;
+      mounted = false;
     };
-  }, []);
+  }, [personaId, navigate]);
 
   useEffect(() => {
-    if (!isPersonaReady) {
+    if (!activePersonaId) {
       return;
     }
-
-    let isMounted = true;
-
-    const loadChatState = async () => {
+    let mounted = true;
+    const load = async () => {
       try {
-        const [nextConversations] = await Promise.all([loadConversations(), loadKnowledgeDocuments()]);
-
-        if (!isMounted) {
+        const nextConversations = await loadConversations();
+        if (!mounted) {
           return;
         }
-
-        const storedConversationId = conversationId || getStoredConversationId(activePersonaId);
+        const storedConversationId = getStoredConversationId(activePersonaId);
         const fallbackConversationId = nextConversations[0]?.id ?? null;
         const nextConversationId = storedConversationId || fallbackConversationId;
-
         if (!nextConversationId) {
           setMessages([]);
           return;
         }
-
-        if (nextConversationId !== conversationId) {
-          setConversationId(nextConversationId);
-        }
-
+        setConversationId(nextConversationId);
         await loadCurrentConversation(nextConversationId);
       } catch (err) {
-        console.warn("Unable to load chat state:", err);
+        if (mounted) {
+          setError(err instanceof Error ? err.message : "Unable to load chat.");
+        }
       }
     };
-
-    void loadChatState();
-
+    void load();
     return () => {
-      isMounted = false;
+      mounted = false;
     };
-  }, [conversationId, isPersonaReady, activePersonaId]);
+  }, [activePersonaId]);
 
   useEffect(() => {
     const transcript = transcriptRef.current;
-
     if (!transcript) {
       return;
     }
-
-    transcript.scrollTo({
-      top: transcript.scrollHeight,
-      behavior: "smooth"
-    });
+    transcript.scrollTo({ top: transcript.scrollHeight, behavior: "smooth" });
   }, [messages, isLoading]);
 
   const sendMessage = async () => {
     const message = input.trim();
-
-    if (!message || isLoading || !isPersonaReady) {
+    if (!message || isLoading || !activePersonaId) {
       return;
     }
-
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      text: message
-    };
+    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", text: message };
     const assistantMessageId = crypto.randomUUID();
     const streamAbortController = new AbortController();
-
     streamAbortRef.current?.abort();
     streamAbortRef.current = streamAbortController;
-    setMessages((current) => [
-      ...current,
-      userMessage,
-      {
-        id: assistantMessageId,
-        role: "assistant",
-        text: ""
-      }
-    ]);
+    setMessages((current) => [...current, userMessage, { id: assistantMessageId, role: "assistant", text: "" }]);
     setInput("");
     setPlaybackRequest((value) => value + 1);
     setIsLoading(true);
@@ -365,28 +408,22 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
 
     const applyChatSuccess = (data: Record<string, unknown>, fallbackReply = "") => {
       const reply = typeof data.reply === "string" ? data.reply : fallbackReply;
-      const nextConversationId =
-        typeof data.conversationId === "string" ? data.conversationId : conversationId;
+      const nextConversationId = typeof data.conversationId === "string" ? data.conversationId : conversationId;
       const grounding = data.grounding as
         | { knowledge?: string[]; memories?: string[]; documents?: string[]; priorChats?: string[] }
         | undefined;
-
       updateAssistantMessage(reply);
       setResponse(reply);
-
       if (nextConversationId) {
         setConversationId(nextConversationId);
-        if (activePersonaId) {
-          window.localStorage.setItem(getConversationStorageKey(activePersonaId), nextConversationId);
-          void persistSessionState({
-            currentPersonaId: activePersonaId,
-            currentConversationId: nextConversationId,
-            sidebarHistoryOpen: showConversationList
-          });
-        }
+        window.localStorage.setItem(getConversationStorageKey(activePersonaId), nextConversationId);
+        void persistSessionState({
+          currentPersonaId: activePersonaId,
+          currentConversationId: nextConversationId,
+          sidebarHistoryOpen: showConversationList
+        });
       }
-
-      setPersonaName((data.personaName as string) ?? "Persona Avatar");
+      setPersonaName((data.personaName as string) ?? personaName);
       setGroundingItems(
         uniqueItems([
           ...(grounding?.knowledge ?? []),
@@ -400,19 +437,12 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
     const sendWithoutStreaming = async () => {
       const { response, data } = await fetchApi("/api/chat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          message,
-          conversationId
-        })
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, conversationId })
       });
-
       if (!response.ok) {
         throw new Error(data.error ?? "Backend error");
       }
-
       applyChatSuccess(data as Record<string, unknown>);
     };
 
@@ -420,94 +450,47 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
       const streamResponse = await fetch(`${API_BASE_URL}/api/chat/stream`, {
         method: "POST",
         credentials: "include",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          message,
-          conversationId
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, conversationId }),
         signal: streamAbortController.signal
       });
-
       if (!streamResponse.ok || !streamResponse.body) {
-        let streamError = `Streaming chat failed (${streamResponse.status})`;
-        try {
-          const errorData = await streamResponse.clone().json();
-          streamError = errorData.error ?? streamError;
-        } catch {
-          const errorText = await streamResponse.text().catch(() => "");
-          streamError = errorText || streamError;
-        }
-
-        if (streamResponse.status === 401) {
-          throw new Error(streamError);
-        }
-
-        console.warn("Streaming unavailable, using non-streaming chat:", streamError);
         await sendWithoutStreaming();
-        void refreshConversationsAfterChat();
-        return;
-      }
-
-      const reader = streamResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let streamedReply = "";
-
-      const handleStreamEvent = (eventName: string, eventData: Record<string, unknown>) => {
-        if (eventName === "meta" && typeof eventData.conversationId === "string") {
-          setConversationId(eventData.conversationId);
-          if (activePersonaId) {
-            window.localStorage.setItem(getConversationStorageKey(activePersonaId), eventData.conversationId);
+      } else {
+        const reader = streamResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let streamedReply = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split(/\n\n/);
+          buffer = blocks.pop() ?? "";
+          for (const block of blocks) {
+            const eventLine = block.split(/\n/).find((line) => line.startsWith("event:"));
+            const dataLine = block.split(/\n/).find((line) => line.startsWith("data:"));
+            const eventName = eventLine?.slice(6).trim() || "message";
+            const rawData = dataLine?.slice(5).trim() || "{}";
+            const eventData = JSON.parse(rawData) as Record<string, unknown>;
+            if (eventName === "token" && typeof eventData.token === "string") {
+              streamedReply += eventData.token;
+              updateAssistantMessage(streamedReply);
+            }
+            if (eventName === "done") {
+              applyChatSuccess(eventData, streamedReply);
+            }
           }
         }
-
-        if (eventName === "token" && typeof eventData.token === "string") {
-          streamedReply += eventData.token;
-          updateAssistantMessage(streamedReply);
-        }
-
-        if (eventName === "done") {
-          applyChatSuccess(eventData, streamedReply);
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-        const blocks = buffer.split(/\n\n/);
-        buffer = blocks.pop() ?? "";
-
-        for (const block of blocks) {
-          const eventLine = block.split(/\n/).find((line) => line.startsWith("event:"));
-          const dataLine = block.split(/\n/).find((line) => line.startsWith("data:"));
-          const eventName = eventLine?.slice(6).trim() || "message";
-          const rawData = dataLine?.slice(5).trim() || "{}";
-          const eventData = JSON.parse(rawData) as Record<string, unknown>;
-
-          if (eventName === "error") {
-            throw new Error(typeof eventData.error === "string" ? eventData.error : "Backend error");
-          }
-
-          handleStreamEvent(eventName, eventData);
-        }
       }
-
-      void refreshConversationsAfterChat();
+      void loadConversations();
     } catch (err) {
-      console.error(err);
-      if (err instanceof DOMException && err.name === "AbortError") {
-        return;
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        setMessages((current) => current.filter((currentMessage) => currentMessage.id !== assistantMessageId));
+        setError(err instanceof Error ? err.message : "Backend error");
       }
-      setMessages((current) => current.filter((currentMessage) => currentMessage.id !== assistantMessageId));
-      setError(err instanceof Error ? err.message : "Backend error");
-      setResponse("");
     } finally {
       if (streamAbortRef.current === streamAbortController) {
         streamAbortRef.current = null;
@@ -516,203 +499,39 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
     }
   };
 
-  const refreshConversationsAfterChat = async () => {
-    try {
-      await loadConversations();
-    } catch (err) {
-      console.warn("Failed to refresh conversations:", err);
-    }
-  };
-
-  const uploadKnowledgeFile = async () => {
-    if (!knowledgeFile || isKnowledgeUploading) {
+  const startNewConversation = async () => {
+    const { response, data } = await fetchApi("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Untitled" })
+    });
+    if (!response.ok) {
+      setError(data.error ?? "Failed to create conversation");
       return;
     }
-
-    setIsKnowledgeUploading(true);
-    setError("");
-
-    try {
-      const content = await knowledgeFile.text();
-
-      if (!content.trim()) {
-        throw new Error("That file is empty.");
-      }
-
-      const { response, data } = await fetchApi("/api/rag/documents", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          name: knowledgeFile.name,
-          content,
-          sourceType: "file-upload"
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to upload knowledge file");
-      }
-
-      setKnowledgeFile(null);
-      if (knowledgeFileInputRef.current) {
-        knowledgeFileInputRef.current.value = "";
-      }
-      await loadKnowledgeDocuments();
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "Failed to upload knowledge file");
-    } finally {
-      setIsKnowledgeUploading(false);
-    }
-  };
-
-  const deleteKnowledgeDocument = async (documentId: string) => {
-    try {
-      const { response, data } = await fetchApi(`/api/rag/documents/${documentId}`, {
-        method: "DELETE"
-      });
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to delete knowledge document");
-      }
-
-      setKnowledgeDocuments((current) => current.filter((document) => document.id !== documentId));
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "Failed to delete knowledge document");
-    }
-  };
-
-  const startNewConversation = async () => {
-    try {
-      const { response: res, data } = await fetchApi("/api/conversations", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ title: "Untitled" })
-      });
-
-      if (!res.ok) {
-        throw new Error(data.error ?? "Failed to create conversation");
-      }
-
-      setConversationId(data.id);
-      if (activePersonaId) {
-        window.localStorage.setItem(getConversationStorageKey(activePersonaId), data.id);
-        void persistSessionState({
-          currentPersonaId: activePersonaId,
-          currentConversationId: data.id,
-          sidebarHistoryOpen: showConversationList
-        });
-      }
-      setMessages([]);
-      setResponse("");
-      setGroundingItems([]);
-      setInput("");
-
-      void refreshConversationsAfterChat();
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "Failed to create conversation");
-    }
-  };
-
-  const resetPersona = async () => {
-    try {
-      const { response, data } = await fetchApi("/api/persona", {
-        method: "DELETE"
-      });
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to reset persona");
-      }
-
-      setIsPersonaReady(false);
-      setIsBootstrapLoading(false);
-      setActivePersonaId("");
-      setMessages([]);
-      setResponse("");
-      setGroundingItems([]);
-      setInput("");
-      setConversations([]);
-      setKnowledgeDocuments([]);
-      setSavedPersonas([]);
-      setKnowledgeFile(null);
-      if (knowledgeFileInputRef.current) {
-        knowledgeFileInputRef.current.value = "";
-      }
-      setShowConversationList(false);
-      setConversationId(null);
-      setError("");
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "Failed to reset persona");
-    }
+    setConversationId(data.id);
+    window.localStorage.setItem(getConversationStorageKey(activePersonaId), data.id);
+    setMessages([]);
+    setResponse("");
+    setGroundingItems([]);
+    setInput("");
+    void loadConversations();
   };
 
   const selectConversation = (convId: string) => {
     setConversationId(convId);
-    if (activePersonaId) {
-      window.localStorage.setItem(getConversationStorageKey(activePersonaId), convId);
-      void persistSessionState({
-        currentPersonaId: activePersonaId,
-        currentConversationId: convId,
-        sidebarHistoryOpen: false
-      });
-    }
+    window.localStorage.setItem(getConversationStorageKey(activePersonaId), convId);
+    void persistSessionState({
+      currentPersonaId: activePersonaId,
+      currentConversationId: convId,
+      sidebarHistoryOpen: false
+    });
     setShowConversationList(false);
-    setResponse("");
-    setGroundingItems([]);
-    setInput("");
+    void loadCurrentConversation(convId);
   };
 
-  const selectSavedPersona = async (personaId: string) => {
-    if (!personaId || personaId === activePersonaId || isLoading) {
-      return;
-    }
-
-    setIsLoading(true);
-    setError("");
-
-    try {
-      const { response, data } = await fetchApi("/api/persona/select", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ personaId })
-      });
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Unable to open that persona.");
-      }
-
-      const persona = data.persona as PersonaSummary;
-      applyPersonaDetails(persona, setPersonaName, setPersonaSummary);
-      setSavedPersonas((data.personas ?? []) as SavedPersona[]);
-      setActivePersonaId(data.currentPersonaId ?? persona.id ?? personaId);
-      setConversationId(getStoredConversationId(personaId));
-      void persistSessionState({
-        currentPersonaId: data.currentPersonaId ?? persona.id ?? personaId,
-        currentConversationId: getStoredConversationId(personaId),
-        sidebarHistoryOpen: false
-      });
-      setMessages([]);
-      setResponse("");
-      setGroundingItems([]);
-      setKnowledgeDocuments([]);
-      setConversations([]);
-      setInput("");
-      setShowConversationList(false);
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "Unable to open that persona.");
-    } finally {
-      setIsLoading(false);
-    }
+  const selectSavedPersona = (nextPersonaId: string) => {
+    navigate(`/chat/${nextPersonaId}`);
   };
 
   if (isBootstrapLoading) {
@@ -720,54 +539,10 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
       <main className="app-shell">
         <section className="panel setup-panel">
           <div className="hero-copy">
-            <p className="eyebrow">WhatsApp Persona Setup</p>
+            <p className="eyebrow">Persona Session</p>
             <h1>Loading Persona</h1>
-            <p className="subtitle">Checking whether this browser already has a saved persona.</p>
           </div>
         </section>
-      </main>
-    );
-  }
-
-  if (!isPersonaReady) {
-    return (
-      <main className="app-shell">
-        <PersonaSetup
-          onError={setError}
-          onReady={(persona) => {
-            applyPersonaDetails(persona, setPersonaName, setPersonaSummary);
-            setActivePersonaId(persona.id);
-            setSavedPersonas((current) => {
-              const existing = current.filter((savedPersona) => savedPersona.id !== persona.id);
-              return [
-                {
-                  id: persona.id,
-                  name: persona.name,
-                  avatarInitials: getPersonaInitials(persona.name),
-                  summary: persona.summary,
-                  styleTags: persona.styleTags ?? [],
-                  createdAt: new Date().toISOString(),
-                  lastActive: new Date().toISOString(),
-                  chatCount: 0,
-                  preview: persona.summary,
-                  conversations: [],
-                  files: []
-                },
-                ...existing
-              ];
-            });
-            setError("");
-            setIsPersonaReady(true);
-            setMessages([]);
-            setResponse("");
-            setGroundingItems([]);
-            setConversations([]);
-            setInput("");
-            setShowConversationList(false);
-            setConversationId(null);
-          }}
-        />
-        {error ? <p className="message error">{error}</p> : null}
       </main>
     );
   }
@@ -776,26 +551,16 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
     <main className="app-shell dark-shell">
       <section className="chat-product-shell">
         <header className="top-header">
-          <button
-            className="icon-btn"
-            onClick={() => setIsSidebarCollapsed((current) => !current)}
-            title="Toggle sidebar"
-          >
-            ☰
-          </button>
+          <button className="icon-btn" onClick={() => setIsSidebarCollapsed((current) => !current)} title="Toggle sidebar">☰</button>
           <div className="persona-title-wrap">
-            <div className="persona-avatar pulse-avatar">{getPersonaInitials(personaName)}</div>
+            <div className="persona-avatar">{personaInitials}</div>
             <div>
               <h1>{personaName}</h1>
               <p>{isLoading ? "Typing..." : "Online"}</p>
             </div>
           </div>
-          <button className="icon-btn" onClick={() => void logout()} title="Sign out">
-            🚪
-          </button>
-          <button className="icon-btn" onClick={() => void resetPersona()} title="Persona settings">
-            ⋯
-          </button>
+          <button className="icon-btn" onClick={() => navigate("/personas")} title="Personas">⌂</button>
+          <button className="icon-btn" onClick={() => void logout()} title="Sign out">⎋</button>
         </header>
 
         <div className="app-layout">
@@ -803,91 +568,38 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
             <section className="compact-card persona-tags">
               <h3>Persona</h3>
               <p className="persona-mini-summary">{personaSummary}</p>
-              <div className="tag-row">
-                <span>Short replies</span>
-                <span>Casual tone</span>
-                <span>Work-focused</span>
-                <span>WhatsApp style</span>
-              </div>
-            </section>
-
-            {savedPersonas.length > 0 ? (
-              <section className="compact-card">
-                <h3>Saved Personas</h3>
-                <div className="mini-list persona-history-list">
-                  {savedPersonas.slice(0, 6).map((persona) => (
-                    <button
-                      key={persona.id}
-                      className={`persona-history-item ${persona.id === activePersonaId ? "active" : ""}`}
-                      onClick={() => void selectSavedPersona(persona.id)}
-                    >
-                      <span className="persona-history-avatar">{persona.avatarInitials || getPersonaInitials(persona.name)}</span>
-                      <span className="persona-history-copy">
-                        <strong>{persona.name}</strong>
-                        <small>{persona.chatCount} chats · {formatCompactTimestamp(persona.lastActive)}</small>
-                        <em>{persona.preview || persona.summary}</em>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            ) : null}
-
-            <section className="compact-card action-row">
-              <button className="ghost-btn" onClick={() => void startNewConversation()}>
-                New Chat
-              </button>
-              <button
-                className="ghost-btn"
-                onClick={() =>
-                  setShowConversationList((current) => {
-                    const next = !current;
-                    void persistSessionState({
-                      currentPersonaId: activePersonaId,
-                      currentConversationId: conversationId,
-                      sidebarHistoryOpen: next
-                    });
-                    return next;
-                  })
-                }
-              >
-                History
-              </button>
             </section>
 
             <section className="compact-card">
-              <h3>Knowledge Files</h3>
-              <div className="upload-row">
-                <input
-                  ref={knowledgeFileInputRef}
-                  type="file"
-                  accept=".txt,.md,.markdown,.json,.js,.ts,.tsx,.jsx,.py,.java,.c,.cpp,.csv"
-                  onChange={(event) => setKnowledgeFile(event.target.files?.[0] ?? null)}
-                />
-                <button className="ghost-btn" onClick={() => void uploadKnowledgeFile()} disabled={!knowledgeFile || isKnowledgeUploading}>
-                  {isKnowledgeUploading ? "Uploading..." : "Add"}
-                </button>
-              </div>
-              <div className="mini-list">
-                {knowledgeDocuments.slice(0, 4).map((document) => (
-                  <article key={document.id} className="file-chip">
-                    <div>
-                      <strong>{document.title}</strong>
-                      <p>{document.chunk_count} chunks</p>
-                    </div>
-                    <button className="remove-x" onClick={() => void deleteKnowledgeDocument(document.id)} title="Remove file">
-                      ×
-                    </button>
-                  </article>
+              <h3>Personas</h3>
+              <div className="mini-list persona-history-list">
+                {savedPersonas.slice(0, 8).map((persona) => (
+                  <button
+                    key={persona.id}
+                    className={`persona-history-item ${persona.id === activePersonaId ? "active" : ""}`}
+                    onClick={() => selectSavedPersona(persona.id)}
+                  >
+                    <span className="persona-history-avatar">{persona.avatarInitials || getPersonaInitials(persona.name)}</span>
+                    <span className="persona-history-copy">
+                      <strong>{persona.name}</strong>
+                      <small>{persona.chatCount} chats · {formatCompactTimestamp(persona.lastActive)}</small>
+                      <em>{persona.preview || persona.summary}</em>
+                    </span>
+                  </button>
                 ))}
               </div>
+            </section>
+
+            <section className="compact-card action-row">
+              <button className="ghost-btn" onClick={() => void startNewConversation()}>New Chat</button>
+              <button className="ghost-btn" onClick={() => setShowConversationList((current) => !current)}>History</button>
             </section>
 
             {showConversationList ? (
               <section className="compact-card">
                 <h3>Conversations</h3>
                 <div className="mini-list">
-                  {conversations.slice(0, 8).map((conv) => (
+                  {conversations.slice(0, 10).map((conv) => (
                     <button
                       key={conv.id}
                       className={`history-item ${conv.id === conversationId ? "active" : ""}`}
@@ -905,19 +617,11 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
 
           <section className="chat-workspace">
             {ENABLE_AVATAR ? (
-              <Suspense
-                fallback={
-                  <section className="avatar-strip">
-                    <p>Loading avatar...</p>
-                  </section>
-                }
-              >
+              <Suspense fallback={<section className="avatar-strip"><p>Loading avatar...</p></section>}>
                 <LiveAvatarComponent apiBaseUrl={API_BASE_URL} playbackRequest={playbackRequest} text={response} />
               </Suspense>
             ) : (
-              <section className="avatar-strip">
-                <p>LiveAvatar paused. Chat is active.</p>
-              </section>
+              <section className="avatar-strip"><p>LiveAvatar paused. Chat is active.</p></section>
             )}
 
             <div ref={transcriptRef} className="transcript">
@@ -928,10 +632,9 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
                   <ChatMessageRow key={message.id} message={message} personaInitials={personaInitials} />
                 ))
               )}
-
               {isLoading ? (
                 <article className="chat-row row-ai">
-                  <div className="bubble-avatar">{getPersonaInitials(personaName)}</div>
+                  <div className="bubble-avatar">{personaInitials}</div>
                   <div className="chat-bubble assistant typing-bubble">
                     <span className="typing-dot" />
                     <span className="typing-dot" />
@@ -942,7 +645,6 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
             </div>
 
             <div className="composer modern-composer">
-              <button className="icon-btn" title="Attach file">📎</button>
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -953,10 +655,7 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
                 }}
                 placeholder={`Message ${personaName}...`}
               />
-              <button className="icon-btn" title="Voice input">🎤</button>
-              <button className="send-btn" onClick={() => void sendMessage()} disabled={isLoading || !input.trim()}>
-                ➤
-              </button>
+              <button className="send-btn" onClick={() => void sendMessage()} disabled={isLoading || !input.trim()}>➤</button>
             </div>
 
             <section className="insights">
@@ -969,7 +668,7 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
                   {groundingItems.length > 0 ? (
                     groundingItems.map((item) => (
                       <article key={item} className="insight-card">
-                        <p>📌 Related to</p>
+                        <p>Related to</p>
                         <strong>{item}</strong>
                       </article>
                     ))
@@ -981,7 +680,6 @@ function ChatApp({ logout }: { logout: () => Promise<void> }) {
             </section>
           </section>
         </div>
-
         {error ? <p className="message error">{error}</p> : null}
       </section>
     </main>

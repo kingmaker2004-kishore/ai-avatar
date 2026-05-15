@@ -10,6 +10,7 @@ import {
 type Props = {
   onReady: (persona: PersonaSummary) => void;
   onError: (message: string) => void;
+  compactOnly?: boolean;
 };
 
 type SetupState = "needs-upload" | "choose-person";
@@ -31,7 +32,7 @@ function formatRelativeTime(value: string) {
   return new Date(value).toLocaleDateString();
 }
 
-export default function PersonaSetup({ onReady, onError }: Props) {
+export default function PersonaSetup({ onReady, onError, compactOnly = false }: Props) {
   const [setupState, setSetupState] = useState<SetupState>("needs-upload");
   const [setupFile, setSetupFile] = useState<File | null>(null);
   const [chatImportId, setChatImportId] = useState("");
@@ -165,6 +166,7 @@ export default function PersonaSetup({ onReady, onError }: Props) {
 
   return (
     <main className="persona-library-shell">
+      {!compactOnly ? (
       <aside className="persona-library-sidebar">
         <div className="library-topbar">
           <h1>Saved Personas</h1>
@@ -213,6 +215,7 @@ export default function PersonaSetup({ onReady, onError }: Props) {
           )}
         </div>
       </aside>
+      ) : null}
 
       <section className="persona-library-main">
         <div className="hero-copy">
