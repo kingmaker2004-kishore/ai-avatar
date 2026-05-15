@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "check": "tsc --noEmit",
+    "preview": "vite preview",
+    "serve:static": "node scripts/serve-dist.mjs",
+    "serve:app": "node scripts/serve-app.mjs"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",
@@ -19,8 +22,11 @@
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
     "dotenv": "^17.3.1",
+    "framer-motion": "^12.38.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
+    "react-router-dom": "^7.15.0",
+    "tailwindcss": "^4.3.0",
     "three": "^0.183.2",
     "three-stdlib": "^2.36.1"
   }

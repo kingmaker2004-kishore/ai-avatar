@@ -1967,18 +1967,38 @@ function extractJsonObjectFromText(value) {
     throw new Error("Groq returned an empty persona extraction response.");
   }
 
-  try {
-    return JSON.parse(normalized);
-  } catch {
-    const startIndex = normalized.indexOf("{");
-    const endIndex = normalized.lastIndexOf("}");
+  const fenceMatch = normalized.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const fencedPayload = toText(fenceMatch?.[1]);
+  const objectStart = normalized.indexOf("{");
+  const objectEnd = normalized.lastIndexOf("}");
+  const objectSlice =
+    objectStart !== -1 && objectEnd !== -1 && objectEnd > objectStart
+      ? normalized.slice(objectStart, objectEnd + 1)
+      : "";
 
-    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
-      throw new Error("Groq persona extraction did not contain valid JSON.");
+  const candidates = [normalized, fencedPayload, objectSlice]
+    .map((item) => toText(item))
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      const repaired = candidate
+        .replace(/^[\uFEFF]/, "")
+        .replace(/,\s*([}\]])/g, "$1")
+        .replace(/[\u201C\u201D]/g, "\"")
+        .replace(/[\u2018\u2019]/g, "'");
+
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        // Try next candidate
+      }
     }
-
-    return JSON.parse(normalized.slice(startIndex, endIndex + 1));
   }
+
+  throw new Error("Groq persona extraction did not contain valid JSON.");
 }
 
 function toScore(value, fallback) {

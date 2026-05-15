@@ -31,6 +31,19 @@ const RAG_STOP_WORDS = new Set([
   "with",
   "you",
   "your"
+  ,"me",
+  "my",
+  "mine",
+  "we",
+  "our",
+  "ours",
+  "they",
+  "their",
+  "them",
+  "please",
+  "pls",
+  "tell",
+  "about"
 ]);
 
 function toText(value) {
@@ -134,19 +147,23 @@ function scoreChunkMatch(queryTokens, normalizedQuery, chunk) {
   const title = normalizeForSearch(chunk.title);
   const content = normalizeForSearch(chunk.content);
   const preview = normalizeForSearch(chunk.preview);
+  const tokenHits = new Set();
   let score = 0;
 
   for (const token of queryTokens) {
     if (title.includes(token)) {
       score += 6;
+      tokenHits.add(token);
     }
 
     if (content.includes(token)) {
       score += 3;
+      tokenHits.add(token);
     }
 
     if (preview.includes(token)) {
       score += 1;
+      tokenHits.add(token);
     }
   }
 
@@ -162,7 +179,14 @@ function scoreChunkMatch(queryTokens, normalizedQuery, chunk) {
     score += 1;
   }
 
-  return score;
+  const coverage = queryTokens.length > 0 ? tokenHits.size / queryTokens.length : 0;
+  const updatedAt = Date.parse(chunk.updated_at ?? "");
+  const ageDays = Number.isFinite(updatedAt)
+    ? Math.max(0, (Date.now() - updatedAt) / (1000 * 60 * 60 * 24))
+    : 90;
+  const recencyBoost = Math.max(0, 2 - Math.floor(ageDays / 14));
+
+  return score + Math.round(coverage * 8) + recencyBoost;
 }
 
 function getMinimumChunkScore(queryTokens, normalizedQuery) {
@@ -171,10 +195,10 @@ function getMinimumChunkScore(queryTokens, normalizedQuery) {
   }
 
   if (normalizedQuery.length >= 16) {
-    return 6;
+    return 8;
   }
 
-  return queryTokens.length <= 1 ? 6 : 5;
+  return queryTokens.length <= 1 ? 7 : 7;
 }
 
 export function chunkKnowledgeDocument(content) {
@@ -205,7 +229,13 @@ export function retrieveDocumentContext(userMessage, recentMessages = [], stored
       score: scoreChunkMatch(queryTokens, normalizedQuery, chunk)
     }))
     .filter((entry) => entry.score >= minimumScore)
-    .sort((left, right) => right.score - left.score);
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      return Date.parse(right.chunk.updated_at ?? "") - Date.parse(left.chunk.updated_at ?? "");
+    });
 
   const selectedChunks = [];
   const seenDocuments = new Set();

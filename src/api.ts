@@ -16,6 +16,7 @@ export type Conversation = {
 };
 
 export type PersonaSummary = {
+  id: string;
   configured: boolean;
   source: string;
   selectedPerson: string;
@@ -23,12 +24,31 @@ export type PersonaSummary = {
   role: string;
   summary: string;
   sourcePath: string;
+  styleTags?: string[];
+};
+
+export type SavedPersona = {
+  id: string;
+  name: string;
+  avatarInitials: string;
+  summary: string;
+  styleTags: string[];
+  createdAt: string;
+  lastActive: string;
+  chatCount: number;
+  preview: string;
+  conversations: Conversation[];
+  files: KnowledgeDocument[];
 };
 
 export type BootstrapResponse = {
   userId: string;
   requiresSetup: boolean;
   persona: PersonaSummary;
+  personas: SavedPersona[];
+  currentPersonaId: string;
+  lastConversationId?: string | null;
+  sidebarHistoryOpen?: boolean;
 };
 
 export type Participant = {

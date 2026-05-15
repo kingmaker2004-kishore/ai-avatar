@@ -1889,9 +1889,11 @@ export function planPersonaReply({
     ? buildGenericClarifyingReply(userMessage, analysis)
     : lacksGroundedAnswer
       ? buildInsufficientContextReply(analysis)
-    : "";
+      : "";
+  const isWhatsAppPersona = /whatsapp chat persona/i.test(toText(profile?.person?.role));
   const canUseHeuristicReply =
     profile?.defaults?.enableHeuristicReplies &&
+    !isWhatsAppPersona &&
     !clarity.shouldClarify &&
     !lacksGroundedAnswer &&
     analysis.messageNeed.responseMode === "persona-chat" &&

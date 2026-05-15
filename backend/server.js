@@ -49,6 +49,8 @@ app.use(
 app.use(express.json({ limit: "10mb" }));
 
 const port = Number(process.env.PORT ?? 5000);
+const serveFrontend = process.env.SERVE_FRONTEND === "true";
+const frontendDistDirectory = path.join(backendDirectory, "..", "dist");
 const liveAvatarApiKey = process.env.LIVEAVATAR_API_KEY ?? process.env.HEYGEN_API_KEY;
 const personaProfilePath = process.env.PERSONA_PROFILE_PATH;
 const personaHistoryTurns = sanitizeInteger(process.env.PERSONA_HISTORY_TURNS, 5, 1);
@@ -69,6 +71,8 @@ const sessionSecret = process.env.SESSION_SECRET ?? "local-dev-persona-session-s
 const userSessionCookieName = "persona_user_session";
 const allowSharedPersonaProfile = process.env.ALLOW_SHARED_PERSONA_PROFILE === "true";
 const persistImportedPersonaProfile = process.env.PERSIST_IMPORTED_PERSONA_PROFILE === "true";
+const chatImportTtlMs = sanitizeInteger(process.env.CHAT_IMPORT_TTL_MS, 15 * 60 * 1000, 60 * 1000);
+const chatImportCache = new Map();
 
 function buildReplyFormattingOptions(replyMaxTokens) {
   if (replyMaxTokens >= 160) {
@@ -118,6 +122,42 @@ function loadEnvFile(envPath) {
       process.env[key] = value;
     }
   }
+}
+
+function createChatImport(userId, chatText, messages) {
+  const id = crypto.randomUUID();
+  chatImportCache.set(id, {
+    userId,
+    chatText,
+    messages,
+    createdAt: Date.now()
+  });
+  return id;
+}
+
+function pruneExpiredChatImports() {
+  const now = Date.now();
+  for (const [id, entry] of chatImportCache.entries()) {
+    if (now - entry.createdAt > chatImportTtlMs) {
+      chatImportCache.delete(id);
+    }
+  }
+}
+
+function consumeChatImport(userId, chatImportId) {
+  pruneExpiredChatImports();
+
+  if (!chatImportId || typeof chatImportId !== "string") {
+    return null;
+  }
+
+  const entry = chatImportCache.get(chatImportId);
+  if (!entry || entry.userId !== userId) {
+    return null;
+  }
+
+  chatImportCache.delete(chatImportId);
+  return entry;
 }
 
 function sanitizeInteger(value, fallback, minimum = 0) {
@@ -259,93 +299,187 @@ function migrateSavedWhatsAppPersonas() {
   return migratedCount;
 }
 
-function getUserPersonaState(userId) {
+function createPersonaLibraryEntry(entry) {
+  const personaId = compactWhitespace(entry?.id) || crypto.randomUUID();
+  const rawProfile = entry?.profile && typeof entry.profile === "object" ? entry.profile : createFallbackPersonaProfile();
+  const { profile: upgradedProfile, changed } =
+    entry?.source === "whatsapp-import"
+      ? upgradeImportedPersonaProfile(rawProfile)
+      : { profile: rawProfile, changed: false };
+  const normalizedProfile = normalizePersonaProfile(upgradedProfile, "user-preferences");
+  const selectedPerson = compactWhitespace(entry?.selectedPerson || entry?.profile?.person?.name || normalizedProfile.person.name);
+  const styleTags = Array.isArray(entry?.styleTags) && entry.styleTags.length > 0
+    ? entry.styleTags
+    : ["Short replies", "Casual tone", "Work-focused", "WhatsApp style"];
+  return {
+    id: personaId,
+    source: entry?.source ?? "whatsapp-import",
+    selectedPerson,
+    configuredAt: entry?.configuredAt ?? new Date().toISOString(),
+    profile: upgradedProfile,
+    normalizedProfile,
+    changed,
+    summary: normalizedProfile.person.summary,
+    initials: selectedPerson
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase() ?? "")
+      .join(""),
+    styleTags
+  };
+}
+
+function getPersonaLibraryState(userId) {
   const profile = db.getUserProfile(userId);
   const preferences = profile.preferences ?? {};
-  const savedPersona = preferences.persona;
+  const savedPersonas = Array.isArray(preferences.personas) ? preferences.personas : [];
+  const legacyPersona =
+    savedPersonas.length === 0 && preferences.persona?.profile && typeof preferences.persona.profile === "object"
+      ? [{ id: crypto.randomUUID(), ...preferences.persona }]
+      : [];
+  const nextPreferences = { ...preferences };
+  const legacyEntries = [...legacyPersona, ...savedPersonas].map((entry) => createPersonaLibraryEntry(entry));
+  const storedPersonas = db.listPersonas(userId);
+  const storedIds = new Set(storedPersonas.map((persona) => persona.id));
 
-  if (savedPersona?.profile && typeof savedPersona.profile === "object") {
-    const {
-      profile: upgradedSavedProfile,
-      changed: savedProfileChanged
-    } =
-      savedPersona.source === "whatsapp-import"
-        ? upgradeImportedPersonaProfile(savedPersona.profile)
-        : { profile: savedPersona.profile, changed: false };
-
-    if (savedProfileChanged) {
-      const upgradedPreferences = {
-        ...preferences,
-        persona: {
-          ...savedPersona,
-          profile: upgradedSavedProfile
-        }
-      };
-
-      db.updateUserPreferences(userId, upgradedPreferences);
-      if (persistImportedPersonaProfile) {
-        writeBasePersonaProfile(upgradedSavedProfile);
-      }
+  for (const entry of legacyEntries) {
+    if (!storedIds.has(entry.id) || entry.changed) {
+      db.upsertPersona(userId, entry);
     }
+  }
 
+  let personaEntries = db.listPersonas(userId).map((entry) => createPersonaLibraryEntry(entry));
+
+  if (personaEntries.some((entry) => entry.changed)) {
+    for (const entry of personaEntries.filter((persona) => persona.changed)) {
+      db.upsertPersona(userId, entry);
+    }
+    personaEntries = db.listPersonas(userId).map((entry) => createPersonaLibraryEntry(entry));
+  }
+
+  if (legacyPersona.length > 0 || savedPersonas.length > 0) {
+    nextPreferences.currentPersonaId = nextPreferences.currentPersonaId || personaEntries[0]?.id || "";
+    delete nextPreferences.persona;
+    delete nextPreferences.personas;
+  }
+
+  if (legacyPersona.length > 0 || savedPersonas.length > 0) {
+    db.updateUserPreferences(userId, nextPreferences);
+  }
+
+  const currentPersonaId = compactWhitespace(nextPreferences.currentPersonaId || preferences.currentPersonaId) || personaEntries[0]?.id || "";
+  const activePersona = currentPersonaId
+    ? personaEntries.find((entry) => entry.id === currentPersonaId) ?? personaEntries[0] ?? null
+    : null;
+
+  if (activePersona) {
+    if (preferences.currentPersonaId !== activePersona.id) {
+      db.updateUserPreferences(userId, {
+        ...nextPreferences,
+        currentPersonaId: activePersona.id
+      });
+    }
+    db.assignOrphanedPersonaData(userId, activePersona.id);
+  }
+
+  return {
+    personas: personaEntries,
+    activePersona,
+    currentPersonaId: activePersona?.id ?? "",
+    baseProfile: allowSharedPersonaProfile
+      ? getConfiguredBasePersonaProfile()
+      : normalizePersonaProfile(createFallbackPersonaProfile(), "user-setup-required")
+  };
+}
+
+function getUserPersonaState(userId) {
+  const libraryState = getPersonaLibraryState(userId);
+
+  if (libraryState.activePersona) {
     return {
       isConfigured: true,
-      source: savedPersona.source ?? "whatsapp-import",
-      selectedPerson: savedPersona.selectedPerson ?? upgradedSavedProfile.person?.name ?? "",
-      profile: normalizePersonaProfile(upgradedSavedProfile, "user-preferences")
+      id: libraryState.activePersona.id,
+      source: libraryState.activePersona.source,
+      selectedPerson: libraryState.activePersona.selectedPerson,
+      profile: libraryState.activePersona.normalizedProfile,
+      styleTags: libraryState.activePersona.styleTags,
+      personas: libraryState.personas
     };
   }
 
-  const baseProfile = allowSharedPersonaProfile
-    ? getConfiguredBasePersonaProfile()
-    : normalizePersonaProfile(createFallbackPersonaProfile(), "user-setup-required");
+  const baseProfile = libraryState.baseProfile;
+
   const hasConfiguredBaseProfile = !isNeutralFallbackProfile(baseProfile);
 
   if (hasConfiguredBaseProfile) {
     return {
       isConfigured: true,
+      id: "shared-persona-profile",
       source: "persona-profile",
       selectedPerson: baseProfile.person.name,
-      profile: baseProfile
+      profile: baseProfile,
+      styleTags: ["Shared profile"],
+      personas: []
     };
   }
 
   return {
     isConfigured: false,
+    id: "",
     source: "default",
     selectedPerson: "",
-    profile: baseProfile
+    profile: baseProfile,
+    styleTags: [],
+    personas: []
   };
 }
 
 function saveUserPersona(userId, selectedPerson, rawProfile) {
   const { profile: upgradedProfile } = upgradeImportedPersonaProfile(rawProfile);
   const currentProfile = db.getUserProfile(userId);
-  const nextPreferences = {
-    ...(currentProfile.preferences ?? {}),
-    persona: {
-      source: "whatsapp-import",
-      selectedPerson,
-      configuredAt: new Date().toISOString(),
-      profile: upgradedProfile
-    }
-  };
-
-  db.archiveUserConversations(userId);
+  const personaId = crypto.randomUUID();
+  const personaEntry = createPersonaLibraryEntry({
+    id: personaId,
+    source: "whatsapp-import",
+    selectedPerson,
+    configuredAt: new Date().toISOString(),
+    profile: upgradedProfile
+  });
 
   if (persistImportedPersonaProfile) {
     writeBasePersonaProfile(upgradedProfile);
   }
 
-  db.updateUserPreferences(userId, nextPreferences);
+  db.upsertPersona(userId, personaEntry);
+  db.updateUserPreferences(userId, {
+    ...(currentProfile.preferences ?? {}),
+    currentPersonaId: personaId
+  });
+  db.assignOrphanedPersonaData(userId, personaId);
+  return getUserPersonaState(userId);
+}
+
+function setCurrentPersona(userId, personaId) {
+  const currentProfile = db.getUserProfile(userId);
+  const persona = db.getPersona(userId, compactWhitespace(personaId));
+
+  if (!persona) {
+    return null;
+  }
+
+  db.updateUserPreferences(userId, {
+    ...(currentProfile.preferences ?? {}),
+    currentPersonaId: persona.id
+  });
+  db.touchPersonaActivity(userId, persona.id);
+  db.assignOrphanedPersonaData(userId, persona.id);
   return getUserPersonaState(userId);
 }
 
 function clearUserPersona(userId) {
   const currentProfile = db.getUserProfile(userId);
-  const nextPreferences = { ...(currentProfile.preferences ?? {}) };
-  delete nextPreferences.persona;
-  db.archiveUserConversations(userId);
+  const nextPreferences = { ...(currentProfile.preferences ?? {}), currentPersonaId: "" };
 
   if (persistImportedPersonaProfile) {
     writeBasePersonaProfile(createFallbackPersonaProfile());
@@ -356,14 +490,36 @@ function clearUserPersona(userId) {
 
 function buildPersonaResponse(personaState) {
   return {
+    id: personaState.id,
     configured: personaState.isConfigured,
     source: personaState.source,
     selectedPerson: personaState.selectedPerson,
     name: personaState.profile.person.name,
     role: personaState.profile.person.role,
     summary: personaState.profile.person.summary,
-    sourcePath: personaState.profile.sourcePath
+    sourcePath: personaState.profile.sourcePath,
+    styleTags: personaState.styleTags ?? []
   };
+}
+
+function buildPersonaLibraryResponse(userId, personas) {
+  return personas.map((persona) => {
+    const conversations = db.getUserConversations(userId, persona.id, 200);
+    const knowledgeDocuments = db.listKnowledgeDocuments(userId, persona.id);
+    return {
+      id: persona.id,
+      name: persona.selectedPerson,
+      avatarInitials: persona.initials,
+      summary: persona.summary,
+      styleTags: persona.styleTags,
+      createdAt: persona.configuredAt,
+      lastActive: conversations[0]?.updated_at ?? persona.configuredAt,
+      chatCount: conversations.length,
+      preview: conversations[0]?.last_message ?? persona.summary,
+      conversations,
+      files: knowledgeDocuments
+    };
+  });
 }
 
 const migratedSavedPersonaCount = migrateSavedWhatsAppPersonas();
@@ -424,7 +580,19 @@ function setUserSessionCookie(res, userId) {
   });
 }
 
-function getUserId(req, res) {
+function clearUserSessionCookie(res) {
+  res.clearCookie(userSessionCookieName, {
+    httpOnly: true,
+    path: "/",
+    sameSite: "lax"
+  });
+}
+
+function getUserId(req) {
+  if (req.userId) {
+    return req.userId;
+  }
+
   const cookies = parseCookies(req.headers.cookie);
   const sessionCookie = cookies[userSessionCookieName];
 
@@ -436,33 +604,63 @@ function getUserId(req, res) {
       const signature = sessionCookie.slice(separatorIndex + 1);
 
       if (isValidSignedValue(userId, signature)) {
-        return userId;
+        const user = db.getUserById(userId);
+        return user ? user.id : null;
       }
     }
   }
 
-  const userId = crypto.randomUUID();
-  setUserSessionCookie(res, userId);
-  return userId;
+  return null;
 }
 
-function getOrCreateConversation(db, userId, conversationId) {
+function serializeUser(user) {
+  if (!user) {
+    return null;
+  }
+
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.display_name ?? user.email?.split("@")[0] ?? "User"
+  };
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function requireAuth(req, res, next) {
+  const userId = getUserId(req);
+
+  if (!userId) {
+    return res.status(401).json({ error: "Authentication required." });
+  }
+
+  req.userId = userId;
+  return next();
+}
+
+function getOrCreateConversation(db, userId, personaId, conversationId) {
   if (!conversationId || typeof conversationId !== "string" || !conversationId.trim()) {
-    return db.createConversation(userId);
+    return db.createConversation(userId, personaId);
   }
 
   const normalizedConversationId = conversationId.trim();
-  const conversation = db.getConversation(normalizedConversationId, userId);
+  const conversation = db.getConversation(normalizedConversationId, userId, personaId);
 
   if (!conversation) {
-    return db.createConversation(userId);
+    return db.createConversation(userId, personaId);
   }
 
   return conversation;
 }
 
-function updateConversationTitle(db, userId, conversationId) {
-  const conversation = db.getConversation(conversationId, userId);
+function updateConversationTitle(db, userId, personaId, conversationId) {
+  const conversation = db.getConversation(conversationId, userId, personaId);
 
   const shouldAutoTitle =
     conversation &&
@@ -480,7 +678,7 @@ function updateConversationTitle(db, userId, conversationId) {
 
   const words = firstUserMessage.content.split(/\s+/);
   const title = words.slice(0, 8).join(" ");
-  db.updateConversationTitle(conversationId, userId, title);
+  db.updateConversationTitle(conversationId, userId, personaId, title);
 }
 
 function compactWhitespace(value) {
@@ -597,10 +795,15 @@ function buildGroqMessages(systemPrompt, recentMessages, userMessage) {
   ];
 }
 
-function saveConversationReply(db, userId, conversationId, userMessage, reply) {
+function saveConversationReply(db, userId, personaId, conversationId, userMessage, reply) {
   db.addMessage(conversationId, "user", userMessage);
   db.addMessage(conversationId, "assistant", reply);
-  updateConversationTitle(db, userId, conversationId);
+  db.touchPersonaActivity(userId, personaId);
+  db.updateSessionState(userId, {
+    currentPersonaId: personaId,
+    currentConversationId: conversationId
+  });
+  updateConversationTitle(db, userId, personaId, conversationId);
 }
 
 /**
@@ -749,6 +952,61 @@ function buildChatSuccessResponse({
     grounding: buildGroundingPayload(retrievedContext, sharedConversationMemories, documentContext),
     evaluation // Include real-time evaluation scores
   };
+}
+
+function scoreCandidateReply(reply, userMessage, profile, retrievedContext, documentContext, recentMessages) {
+  const evaluation = evaluateChatExchange(
+    userMessage,
+    reply,
+    selectEvaluationChunks(retrievedContext, documentContext),
+    recentMessages
+  );
+  const normalizedReply = compactWhitespace(reply).toLowerCase();
+  const normalizedUser = compactWhitespace(userMessage).toLowerCase();
+  const personaPhrases = profile?.person?.signaturePhrases ?? [];
+  let score = evaluation?.overall ?? 2.5;
+
+  if (normalizedReply.length > 0 && normalizedReply.length <= 220) {
+    score += 0.5;
+  }
+
+  if (normalizedReply.length > 280) {
+    score -= 0.75;
+  }
+
+  if (normalizedUser.endsWith("?") && /\?/.test(normalizedReply)) {
+    score += 0.25;
+  }
+
+  if (personaPhrases.some((phrase) => normalizedReply.includes(compactWhitespace(phrase).toLowerCase()))) {
+    score += 0.2;
+  }
+
+  if (/\b(as an ai|language model|retrieved context|provided context)\b/i.test(reply)) {
+    score -= 1.5;
+  }
+
+  return score;
+}
+
+function selectBestReplyCandidate(candidates, context) {
+  const scoredCandidates = candidates
+    .map((candidate) => postProcessPersonaReply(candidate, context.retrievedContext, replyFormattingOptions))
+    .filter(Boolean)
+    .map((reply) => ({
+      reply,
+      score: scoreCandidateReply(
+        reply,
+        context.userMessage,
+        context.profile,
+        context.retrievedContext,
+        context.documentContext,
+        context.recentMessages
+      )
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return scoredCandidates[0]?.reply ?? "";
 }
 
 // Conservative token estimation to stay under provider context limits.
@@ -1136,9 +1394,10 @@ async function parseError(response) {
   }
 }
 
-async function fetchGroqChatCompletion(messages, profile) {
+async function fetchGroqChatCompletion(messages, profile, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const candidateCount = Math.max(1, Math.min(Number(options.candidateCount ?? 1), 3));
 
   try {
     return await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -1150,9 +1409,10 @@ async function fetchGroqChatCompletion(messages, profile) {
       body: JSON.stringify({
         model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
         messages,
-        temperature: profile.defaults.temperature ?? 0.7,
+        temperature: options.temperature ?? profile.defaults.temperature ?? 0.7,
         max_tokens: groqReplyMaxTokens,
-        stream: false
+        stream: Boolean(options.stream),
+        ...(candidateCount > 1 && !options.stream ? { n: candidateCount } : {})
       }),
       signal: controller.signal
     });
@@ -1161,7 +1421,11 @@ async function fetchGroqChatCompletion(messages, profile) {
   }
 }
 
-app.get("/", (_req, res) => {
+app.get("/", (_req, res, next) => {
+  if (serveFrontend && fs.existsSync(path.join(frontendDistDirectory, "index.html"))) {
+    return next();
+  }
+
   res.json({
     ok: true,
     service: "ai-avatar-backend",
@@ -1169,6 +1433,9 @@ app.get("/", (_req, res) => {
     frontendUrl: "http://localhost:5173",
     healthUrl: "/health",
     api: {
+      authSession: "/api/auth/session",
+      authLogin: "/api/auth/login",
+      authLogout: "/api/auth/logout",
       persona: "/api/persona",
       bootstrap: "/api/persona/bootstrap",
       ragDocuments: "/api/rag/documents",
@@ -1183,26 +1450,118 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/api/auth/session", (req, res) => {
+  const userId = getUserId(req);
+  const user = userId ? db.getUserById(userId) : null;
+
+  if (!user) {
+    clearUserSessionCookie(res);
+    return res.json({ authenticated: false, user: null });
+  }
+
+  return res.json({ authenticated: true, user: serializeUser(user) });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+  await sleep(700);
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
+
+  if (password.length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+
+  try {
+    const user = db.getOrCreateUserByEmail(email);
+    setUserSessionCookie(res, user.id);
+
+    return res.json({
+      authenticated: true,
+      user: serializeUser(user)
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    return res.status(500).json({ error: "Unable to sign in." });
+  }
+});
+
+app.post("/api/auth/logout", (_req, res) => {
+  clearUserSessionCookie(res);
+  return res.json({ authenticated: false, user: null });
+});
+
+app.use("/api", requireAuth);
+
 app.get("/api/persona", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   const personaState = getUserPersonaState(userId);
 
   res.json(buildPersonaResponse(personaState));
 });
 
 app.get("/api/persona/bootstrap", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   const personaState = getUserPersonaState(userId);
 
   res.json({
     userId,
     requiresSetup: !personaState.isConfigured,
-    persona: buildPersonaResponse(personaState)
+    persona: buildPersonaResponse(personaState),
+    personas: buildPersonaLibraryResponse(userId, personaState.personas ?? []),
+    currentPersonaId: personaState.id ?? "",
+    lastConversationId: db.getUserProfile(userId).preferences?.currentConversationId ?? null,
+    sidebarHistoryOpen: Boolean(db.getUserProfile(userId).preferences?.sidebarHistoryOpen)
+  });
+});
+
+app.put("/api/session/state", (req, res) => {
+  const userId = getUserId(req);
+  const currentPersonaId = typeof req.body?.currentPersonaId === "string" ? req.body.currentPersonaId.trim() : undefined;
+  const currentConversationId =
+    typeof req.body?.currentConversationId === "string" ? req.body.currentConversationId.trim() : undefined;
+  const sidebarHistoryOpen =
+    typeof req.body?.sidebarHistoryOpen === "boolean" ? req.body.sidebarHistoryOpen : undefined;
+
+  if (currentPersonaId && !db.getPersona(userId, currentPersonaId)) {
+    return res.status(404).json({ error: "Persona not found." });
+  }
+
+  const profile = db.updateSessionState(userId, {
+    currentPersonaId,
+    currentConversationId,
+    sidebarHistoryOpen
+  });
+
+  return res.json({
+    userId,
+    preferences: profile.preferences
+  });
+});
+
+app.post("/api/persona/select", (req, res) => {
+  const userId = getUserId(req);
+  const personaId = typeof req.body?.personaId === "string" ? req.body.personaId.trim() : "";
+  const personaState = setCurrentPersona(userId, personaId);
+
+  if (!personaState) {
+    return res.status(404).json({ error: "Persona not found." });
+  }
+
+  return res.json({
+    userId,
+    persona: buildPersonaResponse(personaState),
+    personas: buildPersonaLibraryResponse(userId, personaState.personas ?? []),
+    currentPersonaId: personaState.id ?? ""
   });
 });
 
 app.post("/api/persona/preview-whatsapp", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
   const messages = parseWhatsAppChat(chatText);
   const participants = getWhatsAppParticipants(messages);
@@ -1213,8 +1572,11 @@ app.post("/api/persona/preview-whatsapp", (req, res) => {
     });
   }
 
+  const chatImportId = createChatImport(userId, chatText, messages);
+
   return res.json({
     userId,
+    chatImportId,
     participantCount: participants.length,
     messageCount: messages.length,
     participants
@@ -1222,10 +1584,12 @@ app.post("/api/persona/preview-whatsapp", (req, res) => {
 });
 
 app.post("/api/persona/configure-whatsapp", async (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
+  const chatImportId = typeof req.body?.chatImportId === "string" ? req.body.chatImportId.trim() : "";
   const selectedPerson = typeof req.body?.selectedPerson === "string" ? req.body.selectedPerson.trim() : "";
-  const messages = parseWhatsAppChat(chatText);
+  const imported = consumeChatImport(userId, chatImportId);
+  const messages = imported?.messages ?? parseWhatsAppChat(chatText);
 
   if (!selectedPerson) {
     return res.status(400).json({ error: "Selected person is required." });
@@ -1233,7 +1597,9 @@ app.post("/api/persona/configure-whatsapp", async (req, res) => {
 
   if (messages.length === 0) {
     return res.status(400).json({
-      error: "Could not find WhatsApp messages in that text file."
+      error: chatImportId
+        ? "Chat import expired. Please upload the WhatsApp export again."
+        : "Could not find WhatsApp messages in that text file."
     });
   }
 
@@ -1243,6 +1609,36 @@ app.post("/api/persona/configure-whatsapp", async (req, res) => {
       model: process.env.GROQ_PERSONA_MODEL ?? process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile"
     });
     const personaState = saveUserPersona(userId, selectedPerson, rawProfile);
+    const chatTextSource = typeof imported?.chatText === "string" ? imported.chatText : chatText;
+    const personaId = personaState.id;
+
+    if (personaId && chatTextSource.trim()) {
+      try {
+        const existingDocuments = db.listKnowledgeDocuments(userId, personaId);
+        for (const document of existingDocuments) {
+          if (document.source_type === "whatsapp-import") {
+            db.deleteKnowledgeDocument(document.id, userId, personaId);
+          }
+        }
+
+        const chunks = chunkKnowledgeDocument(chatTextSource);
+        if (chunks.length > 0) {
+          db.saveKnowledgeDocument(userId, personaId, {
+            title: `WhatsApp Chat with ${selectedPerson}.txt`,
+            sourceType: "whatsapp-import",
+            charCount: chatTextSource.length,
+            metadata: {
+              preview: truncateText(chatTextSource, 260),
+              autoImportedFromSetup: true,
+              selectedPerson
+            },
+            chunks
+          });
+        }
+      } catch (error) {
+        console.warn("Failed to auto-import WhatsApp chat into RAG:", error);
+      }
+    }
 
     return res.json({
       userId,
@@ -1256,7 +1652,7 @@ app.post("/api/persona/configure-whatsapp", async (req, res) => {
 });
 
 app.post("/api/persona/evaluate-whatsapp", async (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   const chatText = typeof req.body?.chatText === "string" ? req.body.chatText : "";
   const messages = parseWhatsAppChat(chatText);
 
@@ -1328,7 +1724,7 @@ app.post("/api/persona/evaluate-whatsapp", async (req, res) => {
 });
 
 app.delete("/api/persona", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
   clearUserPersona(userId);
 
   return res.json({
@@ -1338,10 +1734,15 @@ app.delete("/api/persona", (req, res) => {
 });
 
 app.get("/api/rag/documents", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
+
+  if (!personaState.id) {
+    return res.json({ userId, documents: [] });
+  }
 
   try {
-    const documents = db.listKnowledgeDocuments(userId);
+    const documents = db.listKnowledgeDocuments(userId, personaState.id);
 
     return res.json({
       userId,
@@ -1354,7 +1755,8 @@ app.get("/api/rag/documents", (req, res) => {
 });
 
 app.post("/api/rag/documents", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const title = compactWhitespace(req.body?.name);
   const content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
   const sourceType = compactWhitespace(req.body?.sourceType) || "text-upload";
@@ -1371,14 +1773,33 @@ app.post("/api/rag/documents", (req, res) => {
     return res.status(400).json({ error: "Document is too large. Keep uploads under 250,000 characters." });
   }
 
+  if (!personaState.id) {
+    return res.status(400).json({ error: "Select a persona before uploading files." });
+  }
+
   try {
+    const duplicateDocument = db.findKnowledgeDocumentByFingerprint(
+      userId,
+      personaState.id,
+      title,
+      content.length,
+      sourceType
+    );
+
+    if (duplicateDocument) {
+      return res.status(409).json({
+        error: "That file is already attached to this persona.",
+        document: duplicateDocument
+      });
+    }
+
     const chunks = chunkKnowledgeDocument(content);
 
     if (chunks.length === 0) {
       return res.status(400).json({ error: "Could not extract readable text from that document." });
     }
 
-    const document = db.saveKnowledgeDocument(userId, {
+    const document = db.saveKnowledgeDocument(userId, personaState.id, {
       title,
       sourceType,
       charCount: content.length,
@@ -1399,11 +1820,12 @@ app.post("/api/rag/documents", (req, res) => {
 });
 
 app.delete("/api/rag/documents/:id", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const { id } = req.params;
 
   try {
-    const success = db.deleteKnowledgeDocument(id, userId);
+    const success = personaState.id ? db.deleteKnowledgeDocument(id, userId, personaState.id) : false;
 
     if (!success) {
       return res.status(404).json({ error: "Knowledge document not found." });
@@ -1418,10 +1840,15 @@ app.delete("/api/rag/documents/:id", (req, res) => {
 
 // Conversation management endpoints
 app.get("/api/conversations", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
+
+  if (!personaState.id) {
+    return res.json({ userId, conversations: [] });
+  }
 
   try {
-    const conversations = db.getUserConversations(userId);
+    const conversations = db.getUserConversations(userId, personaState.id);
 
     return res.json({
       userId,
@@ -1434,11 +1861,12 @@ app.get("/api/conversations", (req, res) => {
 });
 
 app.get("/api/conversations/:id", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const { id } = req.params;
 
   try {
-    const conversation = db.getConversation(id, userId);
+    const conversation = personaState.id ? db.getConversation(id, userId, personaState.id) : null;
 
     if (!conversation) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -1452,11 +1880,20 @@ app.get("/api/conversations/:id", (req, res) => {
 });
 
 app.post("/api/conversations", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const { title } = req.body ?? {};
 
+  if (!personaState.id) {
+    return res.status(400).json({ error: "Select a persona first." });
+  }
+
   try {
-    const conversation = db.createConversation(userId, title || "Untitled");
+    const conversation = db.createConversation(userId, personaState.id, title || "Untitled");
+    db.updateSessionState(userId, {
+      currentPersonaId: personaState.id,
+      currentConversationId: conversation.id
+    });
 
     return res.json(conversation);
   } catch (error) {
@@ -1466,7 +1903,8 @@ app.post("/api/conversations", (req, res) => {
 });
 
 app.put("/api/conversations/:id", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const { id } = req.params;
   const { title } = req.body ?? {};
 
@@ -1475,7 +1913,7 @@ app.put("/api/conversations/:id", (req, res) => {
   }
 
   try {
-    const updated = db.updateConversationTitle(id, userId, title);
+    const updated = personaState.id ? db.updateConversationTitle(id, userId, personaState.id, title) : null;
 
     if (!updated) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -1489,11 +1927,12 @@ app.put("/api/conversations/:id", (req, res) => {
 });
 
 app.delete("/api/conversations/:id", (req, res) => {
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
+  const personaState = getUserPersonaState(userId);
   const { id } = req.params;
 
   try {
-    const success = db.archiveConversation(id, userId);
+    const success = personaState.id ? db.archiveConversation(id, userId, personaState.id) : false;
 
     if (!success) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -1567,10 +2006,224 @@ app.post("/api/heygen/session-token", async (_req, res) => {
   }
 });
 
+function writeStreamEvent(res, type, payload = {}) {
+  res.write(`event: ${type}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+async function streamGroqResponse(response, onToken) {
+  const reader = response.body?.getReader();
+
+  if (!reader) {
+    return "";
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (!trimmed.startsWith("data:")) {
+        continue;
+      }
+
+      const payload = trimmed.slice(5).trim();
+
+      if (!payload || payload === "[DONE]") {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(payload);
+        const token = parsed?.choices?.[0]?.delta?.content ?? "";
+
+        if (token) {
+          fullText += token;
+          onToken(token);
+        }
+      } catch {
+        // Ignore malformed stream fragments and keep consuming.
+      }
+    }
+  }
+
+  return fullText;
+}
+
+app.post("/api/chat/stream", async (req, res) => {
+  const userMessage = req.body?.message?.trim();
+  const conversationId = req.body?.conversationId;
+  const userId = getUserId(req);
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  if (!userMessage) {
+    writeStreamEvent(res, "error", { error: "Message is required." });
+    return res.end();
+  }
+
+  if (!process.env.GROQ_API_KEY) {
+    writeStreamEvent(res, "error", { error: "Missing GROQ_API_KEY." });
+    return res.end();
+  }
+
+  try {
+    db.getUserProfile(userId);
+    const personaState = getUserPersonaState(userId);
+
+    if (!personaState.isConfigured || !personaState.id) {
+      writeStreamEvent(res, "error", { error: "Select or create a persona before chatting." });
+      return res.end();
+    }
+
+    const conversation = getOrCreateConversation(db, userId, personaState.id, conversationId);
+    const convId = conversation.id;
+    db.updateSessionState(userId, {
+      currentPersonaId: personaState.id,
+      currentConversationId: convId
+    });
+    writeStreamEvent(res, "meta", { conversationId: convId, personaName: personaState.profile.person.name });
+
+    const recentMessages = db.getRecentMessages(convId, personaHistoryTurns);
+    const sharedConversationMemories = filterConversationMemoriesForMessage(
+      db.getRecentConversationMemories(
+        userId,
+        personaState.id,
+        convId,
+        personaSharedConversationCount,
+        personaSharedConversationTurns
+      ),
+      userMessage
+    );
+    const profile = personaState.profile;
+    const documentContext = retrieveDocumentContext(
+      userMessage,
+      recentMessages,
+      db.getKnowledgeChunks(userId, personaState.id),
+      personaRagMaxChunks
+    );
+    const replyPlan = planPersonaReply({
+      profile,
+      userMessage,
+      recentMessages,
+      maxContextItems: personaMaxContextItems,
+      documentContext
+    });
+    const { messageNeed, retrievedContext, reply: plannedReply } = replyPlan;
+
+    if (plannedReply) {
+      const finalReply = postProcessPersonaReply(plannedReply, retrievedContext, replyFormattingOptions);
+      for (const token of finalReply.split(/(\s+)/).filter(Boolean)) {
+        writeStreamEvent(res, "token", { token });
+        await sleep(18);
+      }
+      saveConversationReply(db, userId, personaState.id, convId, userMessage, finalReply);
+      const evaluation = evaluateChatExchange(
+        userMessage,
+        finalReply,
+        selectEvaluationChunks(retrievedContext, documentContext),
+        recentMessages
+      );
+      writeStreamEvent(res, "done", {
+        ...buildChatSuccessResponse({
+          reply: finalReply,
+          conversationId: convId,
+          userId,
+          profile,
+          retrievedContext,
+          sharedConversationMemories,
+          documentContext,
+          evaluation
+        })
+      });
+      return res.end();
+    }
+
+    const groqRequestContext = buildGroqRequestContext({
+      profile,
+      retrievedContext,
+      messageNeed,
+      sharedConversationMemories,
+      documentContext,
+      recentMessages,
+      userMessage,
+      maxPromptTokens: maxPromptTokensPerRequest
+    });
+
+    const response = await fetchGroqChatCompletion(groqRequestContext.messages, profile, { stream: true });
+
+    if (!response.ok) {
+      writeStreamEvent(res, "error", {
+        error: response.status === 429 ? "Rate limit exceeded. Please try again later." : "Groq request failed.",
+        details: await parseError(response)
+      });
+      return res.end();
+    }
+
+    const streamedReply = await streamGroqResponse(response, (token) => {
+      writeStreamEvent(res, "token", { token });
+    });
+    const reply = postProcessPersonaReply(
+      streamedReply,
+      groqRequestContext.retrievedContext,
+      replyFormattingOptions
+    );
+
+    if (!reply) {
+      writeStreamEvent(res, "error", { error: "Groq returned an empty response." });
+      return res.end();
+    }
+
+    saveConversationReply(db, userId, personaState.id, convId, userMessage, reply);
+    const evaluation = evaluateChatExchange(
+      userMessage,
+      reply,
+      selectEvaluationChunks(groqRequestContext.retrievedContext, groqRequestContext.documentContext),
+      recentMessages
+    );
+
+    writeStreamEvent(res, "done", {
+      ...buildChatSuccessResponse({
+        reply,
+        conversationId: convId,
+        userId,
+        profile,
+        retrievedContext: groqRequestContext.retrievedContext,
+        sharedConversationMemories: groqRequestContext.sharedConversationMemories,
+        documentContext: groqRequestContext.documentContext,
+        evaluation
+      })
+    });
+    return res.end();
+  } catch (error) {
+    console.error("Streaming chat error:", error);
+    writeStreamEvent(res, "error", {
+      error: error instanceof Error ? error.message : "Streaming chat failed."
+    });
+    return res.end();
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
   const userMessage = req.body?.message?.trim();
   const conversationId = req.body?.conversationId;
-  const userId = getUserId(req, res);
+  const userId = getUserId(req);
 
   if (!userMessage) {
     return res.status(400).json({ error: "Message is required." });
@@ -1585,9 +2238,16 @@ app.post("/api/chat", async (req, res) => {
   try {
     // Ensure user profile exists
     db.getUserProfile(userId);
+    const personaState = getUserPersonaState(userId);
+
+    if (!personaState.isConfigured || !personaState.id) {
+      return res.status(400).json({
+        error: "Select or create a persona before chatting."
+      });
+    }
 
     // Get or create conversation
-    const conversation = getOrCreateConversation(db, userId, conversationId);
+    const conversation = getOrCreateConversation(db, userId, personaState.id, conversationId);
     const convId = conversation.id;
 
     // Get recent message history from database
@@ -1595,6 +2255,7 @@ app.post("/api/chat", async (req, res) => {
     const sharedConversationMemories = filterConversationMemoriesForMessage(
       db.getRecentConversationMemories(
         userId,
+        personaState.id,
         convId,
         personaSharedConversationCount,
         personaSharedConversationTurns
@@ -1602,12 +2263,11 @@ app.post("/api/chat", async (req, res) => {
       userMessage
     );
 
-    const personaState = getUserPersonaState(userId);
     const profile = personaState.profile;
     const documentContext = retrieveDocumentContext(
       userMessage,
       recentMessages,
-      db.getKnowledgeChunks(userId),
+      db.getKnowledgeChunks(userId, personaState.id),
       personaRagMaxChunks
     );
     const replyPlan = planPersonaReply({
@@ -1625,7 +2285,7 @@ app.post("/api/chat", async (req, res) => {
         retrievedContext,
         replyFormattingOptions
       );
-      saveConversationReply(db, userId, convId, userMessage, finalReply);
+      saveConversationReply(db, userId, personaState.id, convId, userMessage, finalReply);
 
       // Evaluate the exchange in real-time
       const evaluation = evaluateChatExchange(
@@ -1689,7 +2349,7 @@ app.post("/api/chat", async (req, res) => {
     let response;
     for (let attempt = 0; attempt <= groqRateLimitRetries; attempt += 1) {
       try {
-        response = await fetchGroqChatCompletion(messages, profile);
+        response = await fetchGroqChatCompletion(messages, profile, { candidateCount: 2 });
       } catch (fetchError) {
         if (fetchError.name === "AbortError") {
           console.error(`Groq request timeout after ${requestTimeoutMs}ms`);
@@ -1773,7 +2433,10 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const rawReply = data?.choices?.[0]?.message?.content?.trim();
+    const rawCandidates = Array.isArray(data?.choices)
+      ? data.choices.map((choice) => choice?.message?.content?.trim()).filter(Boolean)
+      : [];
+    const rawReply = rawCandidates[0] ?? "";
     
     if (!rawReply) {
       console.error("Empty reply from Groq:", data);
@@ -1782,11 +2445,13 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const reply = postProcessPersonaReply(
-      rawReply,
-      effectiveRetrievedContext,
-      replyFormattingOptions
-    );
+    const reply = selectBestReplyCandidate(rawCandidates.length > 0 ? rawCandidates : [rawReply], {
+      userMessage,
+      profile,
+      retrievedContext: effectiveRetrievedContext,
+      documentContext: effectiveDocumentContext,
+      recentMessages
+    });
 
     if (!reply) {
       console.error("Post-processing resulted in empty reply:", rawReply);
@@ -1795,7 +2460,7 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    saveConversationReply(db, userId, convId, userMessage, reply);
+    saveConversationReply(db, userId, personaState.id, convId, userMessage, reply);
 
     // Evaluate the exchange in real-time
     const evaluation = evaluateChatExchange(
@@ -1828,6 +2493,37 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+if (serveFrontend && fs.existsSync(path.join(frontendDistDirectory, "index.html"))) {
+  app.use(
+    express.static(frontendDistDirectory, {
+      index: false,
+      etag: true,
+      setHeaders(res, filePath) {
+        const isHashedAsset = /[/\\]assets[/\\].+-[a-zA-Z0-9_-]+\.[a-z0-9]+$/i.test(filePath);
+        res.setHeader(
+          "Cache-Control",
+          isHashedAsset ? "public, max-age=31536000, immutable" : "no-cache"
+        );
+      }
+    })
+  );
+
+  app.use((req, res, next) => {
+    if (req.method !== "GET" || req.path.startsWith("/api/") || req.path === "/health") {
+      return next();
+    }
+
+    if (!req.accepts("html")) {
+      return next();
+    }
+
+    return res.sendFile(path.join(frontendDistDirectory, "index.html"));
+  });
+}
+
 app.listen(port, () => {
   console.log(`Backend running on http://localhost:${port}`);
+  if (serveFrontend) {
+    console.log(`Static frontend mode ${fs.existsSync(path.join(frontendDistDirectory, "index.html")) ? "enabled" : "requested but dist is missing"}.`);
+  }
 });
